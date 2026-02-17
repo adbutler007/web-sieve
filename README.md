@@ -20,7 +20,7 @@ The tool returns **metadata only** — content stays on disk until explicitly re
 ## Install
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/web-sieve.git
+git clone https://github.com/adbutler007/web-sieve.git
 cd web-sieve
 ./install.sh
 ```
