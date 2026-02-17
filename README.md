@@ -81,6 +81,8 @@ hash: a1b2c3d4e5f6
 
 Cache is **permanent and project-scoped** — pages persist across sessions and can be re-queried with different questions.
 
+A `manifest.md` file is auto-generated in the cache directory on every fetch, listing all cached pages in a markdown table. Reference it from your `CLAUDE.md` so Claude knows what's cached even after context compaction.
+
 ## Performance
 
 | Scenario | Pages | Cached | Used | Compression |
