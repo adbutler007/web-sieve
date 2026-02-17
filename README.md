@@ -19,36 +19,40 @@ The tool returns **metadata only** — content stays on disk until explicitly re
 
 ## Install
 
-```bash
-git clone https://github.com/adbutler007/web-sieve.git
-cd web-sieve
-./install.sh
-```
-
-The installer will:
-- Copy `web-sieve.py` to `~/.claude/mcp-servers/`
-- Register it globally with Claude Code
-- Prompt for your [Jina API key](https://jina.ai)
-
 ### Prerequisites
 
 - [Claude Code](https://claude.ai/claude-code) CLI
 - [uv](https://docs.astral.sh/uv/) (Python package runner)
 - A [Jina API key](https://jina.ai) (free tier available)
 
-### Manual install
+### Mac / Linux
 
 ```bash
-# 1. Copy the server
-mkdir -p ~/.claude/mcp-servers
-cp web-sieve.py ~/.claude/mcp-servers/
+git clone https://github.com/adbutler007/web-sieve.git
+cd web-sieve
+./install.sh
+```
 
-# 2. Register with Claude Code
-claude mcp add -s user -e "JINA_API_KEY=your_key" -- web-sieve \
-    uv run --script ~/.claude/mcp-servers/web-sieve.py
+The installer will prompt for your Jina API key, copy the server script to `~/.claude/mcp-servers/`, and register it globally.
 
-# 3. Add workflow instructions to ~/.claude/CLAUDE.md
-cat claude-md-snippet.md >> ~/.claude/CLAUDE.md
+Then paste the contents of `claude-md-snippet.md` into `~/.claude/CLAUDE.md` and restart Claude Code.
+
+### Windows
+
+```powershell
+git clone https://github.com/adbutler007/web-sieve.git
+cd web-sieve
+
+# 1. Copy the server script
+mkdir -p "$env:USERPROFILE\.claude\mcp-servers"
+copy web-sieve.py "$env:USERPROFILE\.claude\mcp-servers\"
+
+# 2. Register with Claude Code (replace YOUR_KEY with your Jina API key)
+claude mcp add -s user -e "JINA_API_KEY=YOUR_KEY" -- web-sieve `
+    uv run --script "$env:USERPROFILE\.claude\mcp-servers\web-sieve.py"
+
+# 3. Append workflow instructions to CLAUDE.md
+Get-Content claude-md-snippet.md | Add-Content "$env:USERPROFILE\.claude\CLAUDE.md"
 
 # 4. Restart Claude Code
 ```
