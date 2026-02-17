@@ -1,0 +1,22 @@
+graph LR
+    subgraph Before["Before compaction"]
+        CTX1["Context knows<br/>about cached pages"]
+    end
+
+    subgraph Compaction["Context compacted"]
+        LOST["Cache awareness<br/>lost"]
+    end
+
+    subgraph After["After compaction"]
+        CM["CLAUDE.md says:<br/>read manifest.md"]
+        MAN["manifest.md<br/>lists all 19 pages"]
+        CM --> MAN
+        MAN --> RESTORED["Cache awareness<br/>restored"]
+    end
+
+    Before --> Compaction
+    Compaction --> After
+
+    style LOST fill:#fdd,stroke:#c00
+    style RESTORED fill:#dfd,stroke:#0a0
+    style MAN fill:#ff9,stroke:#cc0

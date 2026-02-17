@@ -1,0 +1,21 @@
+graph TB
+    subgraph Global["~/.claude/"]
+        CLAUDE["CLAUDE.md<br/>Workflow instructions"]
+        CONFIG[".claude.json<br/>MCP registration<br/>+ JINA_API_KEY"]
+        SERVER["mcp-servers/web-sieve.py<br/>3 tools, ~200 lines"]
+    end
+
+    subgraph Project["Project directory"]
+        CACHE[".web_cache/<br/>Cached markdown files"]
+        MANIFEST[".web_cache/manifest.md<br/>Auto-generated index"]
+    end
+
+    CONFIG -->|"registers"| SERVER
+    CLAUDE -->|"tells Claude Code<br/>how to use it"| SERVER
+    SERVER -->|"writes to"| CACHE
+    SERVER -->|"auto-updates"| MANIFEST
+    CLAUDE -.->|"reads before<br/>web tasks"| MANIFEST
+
+    style SERVER fill:#69f,stroke:#03c
+    style CACHE fill:#fc6,stroke:#c90
+    style MANIFEST fill:#ff9,stroke:#cc0

@@ -1,0 +1,46 @@
+flowchart TB
+    subgraph Discovery
+        WS["1. WebSearch<br/>(built-in)"]
+    end
+
+    subgraph Fetch["2. Fetch + Cache"]
+        BRU["batch_read_urls<br/>(MCP tool)"]
+        J["Jina Reader API<br/>r.jina.ai"]
+        C1[".web_cache/a1b2c3.md"]
+        C2[".web_cache/d4e5f6.md"]
+        C3[".web_cache/g7h8i9.md"]
+        MF[".web_cache/manifest.md"]
+
+        BRU -->|"8 parallel threads"| J
+        J -->|"clean markdown"| C1
+        J --> C2
+        J --> C3
+        BRU -->|"auto-updates"| MF
+    end
+
+    subgraph Triage["3. Haiku Agent Triage"]
+        H1["Agent 1"]
+        H2["Agent 2"]
+        H3["Agent 3"]
+
+        C1 -.-> H1
+        C2 -.-> H2
+        C3 -.-> H3
+
+        H1 -->|JSON| R1["lines 10-45, 80-92"]
+        H2 -->|JSON| R2["not relevant"]
+        H3 -->|JSON| R3["lines 5-30"]
+    end
+
+    subgraph Inject["4. Selective Read"]
+        RE["Read tool<br/>offset/limit"]
+    end
+
+    WS -->|"URLs + summaries"| BRU
+    R1 --> RE
+    R3 --> RE
+    RE --> CTX["Main context<br/>~2K chars<br/>(not 70K)"]
+
+    style CTX fill:#6c6,stroke:#060
+    style R2 fill:#ddd,stroke:#999
+    style MF fill:#ff9,stroke:#cc0

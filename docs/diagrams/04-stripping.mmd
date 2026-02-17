@@ -1,0 +1,13 @@
+graph TD
+    subgraph Before["Raw HTML → Jina Reader"]
+        RAW["Full page with:<br/>nav, header, footer<br/>cookie banners<br/>newsletter popups<br/>sidebar widgets<br/>ad blocks<br/>social share buttons<br/>comment sections<br/>modal overlays<br/>images"]
+    end
+
+    subgraph After["Cached Markdown"]
+        CLEAN["Article content only<br/>as clean markdown"]
+    end
+
+    Before -->|"CSS selector stripping<br/>+ X-Retain-Images: none"| After
+
+    style RAW fill:#fdd,stroke:#c00
+    style CLEAN fill:#dfd,stroke:#0a0
