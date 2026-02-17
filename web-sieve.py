@@ -79,6 +79,40 @@ def _extract_title(content: str) -> str:
     return "Unknown"
 
 
+def _update_manifest(cache_dir: str) -> None:
+    """Rebuild manifest.md from all cached files."""
+    manifest_path = os.path.join(cache_dir, "manifest.md")
+    entries = []
+    for fname in sorted(os.listdir(cache_dir)):
+        if not fname.endswith(".md") or fname == "manifest.md":
+            continue
+        fpath = os.path.join(cache_dir, fname)
+        meta = {"file": fname}
+        with open(fpath) as f:
+            for line in f:
+                if line.strip() == "---" and meta.get("url"):
+                    break
+                if line.startswith("url: "):
+                    meta["url"] = line[5:].strip()
+                elif line.startswith("title: "):
+                    meta["title"] = line[7:].strip()
+                elif line.startswith("fetched: "):
+                    meta["fetched"] = line[9:].strip()
+        entries.append(meta)
+    with open(manifest_path, "w") as f:
+        f.write("# Web Cache Manifest\n\n")
+        f.write("Cached pages available for re-querying with haiku agents.\n\n")
+        f.write(f"| # | Title | URL | File | Fetched |\n")
+        f.write(f"|---|---|---|---|---|\n")
+        for i, e in enumerate(entries, 1):
+            title = e.get("title", "Unknown")
+            url = e.get("url", "")
+            fname = e.get("file", "")
+            fetched = e.get("fetched", "")[:10]
+            f.write(f"| {i} | {title} | {url} | {fname} | {fetched} |\n")
+        f.write(f"\n**Total: {len(entries)} pages cached.**\n")
+
+
 def _fetch_one(url: str, cache_dir: str) -> dict:
     """Fetch a single URL, cache it, return metadata dict."""
     os.makedirs(cache_dir, exist_ok=True)
@@ -143,7 +177,10 @@ def read_url(url: str, cache_dir: str = ".web_cache") -> str:
         cache_dir: Directory to cache markdown files. Use an absolute path to the
                    project's .web_cache/ directory.
     """
-    return json.dumps(_fetch_one(url, cache_dir))
+    result = _fetch_one(url, cache_dir)
+    if "error" not in result:
+        _update_manifest(cache_dir)
+    return json.dumps(result)
 
 
 @mcp.tool()
@@ -167,6 +204,7 @@ def batch_read_urls(urls: list[str], cache_dir: str = ".web_cache") -> str:
     # Return in original URL order
     order = {url: i for i, url in enumerate(urls)}
     results.sort(key=lambda r: order.get(r.get("url", ""), len(urls)))
+    _update_manifest(cache_dir)
     return json.dumps(results)
 
 
