@@ -1,3 +1,6 @@
 .web_cache/
 .DS_Store
 __pycache__/
+calibration/data/
+.venv/
+.pytest_cache/

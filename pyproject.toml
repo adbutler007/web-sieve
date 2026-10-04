@@ -1,0 +1,16 @@
+[project]
+name = "web-sieve"
+version = "0.1.0"
+description = "MCP server that fetches web pages as markdown, caches them, and finds the relevant line ranges with Jev."
+requires-python = ">=3.10"
+dependencies = [
+    "mcp[cli]<2",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
