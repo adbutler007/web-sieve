@@ -5,6 +5,7 @@
 # ///
 """web-sieve: MCP server that fetches web pages as clean markdown via Jina Reader API, with project-level caching."""
 
+import contextlib
 import hashlib
 import http.client
 import json
@@ -18,10 +19,16 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+
+try:
+    import fcntl  # POSIX only; locks manifest rebuilds across processes (_manifest_lock)
+except ImportError:  # Windows has no fcntl; _manifest_lock is then a no-op
+    fcntl = None
 
 from mcp.server.fastmcp import FastMCP
 
@@ -71,7 +78,9 @@ def _extract_title(content: str) -> str:
 # Specification: docs/effectiveness-spec.md, sections 1 to 4.
 
 JINA_BASE = "https://r.jina.ai"     # Reader endpoint; the tests point it at tests/fake_jina.py
-FETCH_TIMEOUT_S = 180               # seconds per Jina request (unchanged from the first version)
+FETCH_TIMEOUT_S = 180               # longest wait for one Jina request (unchanged from the first version)
+FETCH_TOTAL_S = 200.0               # longest time for one URL: every request, retry, wait and alternate request
+FETCH_MIN_ATTEMPT_S = 10.0          # a retry or alternate request is sent only when at least this much of it is left
 FETCH_ATTEMPTS = 2                  # one retry for transport errors and HTTP 408, 429 and 5xx (spec section 2)
 FETCH_BACKOFF_S = 2.0               # wait before the retry when the response has no Retry-After
 RETRY_AFTER_CAP_S = 30.0            # longest Retry-After honoured
@@ -95,6 +104,9 @@ CHALLENGE_PHRASES = ("Just a moment", "Attention Required", "Access denied", "Ve
 # README says needs an API key, so it is sent only when JINA_API_KEY is set.
 ALT_HEADERS = {"X-No-Cache": "true"}
 ALT_PROXY_HEADERS = {"X-Proxy": "auto"}
+STALE_PART_S = 3600                 # a .tmp-*.part file older than this was left by a killed process; removed on fetch
+MANIFEST_LOCK = ".manifest.lock"    # in the cache directory; held while the manifests are rebuilt
+_URL_SAFE = "".join(chr(c) for c in range(0x21, 0x7F))  # printable ASCII except space: sent to Jina as it is
 _PREAMBLE_PREFIXES = ("Title:", "URL Source:", "Published Time:", "Number of Pages:", "Warning:")
 _RETRY_HTTP = (408, 429)
 _BLOCKING = ("challenge", "empty")
@@ -293,22 +305,47 @@ def _cell(text: str) -> str:
     return str(text).replace("|", "\\|").replace("\n", " ")
 
 
+@contextlib.contextmanager
+def _manifest_lock(cache_dir: str):
+    """Hold an exclusive lock on <cache_dir>/.manifest.lock for the duration.
+
+    Two processes fetching into one cache each rebuild the manifests; without
+    the lock, the one that listed the directory first could write last and
+    leave a manifest.json without the other's pages. flock waits for the
+    lock, and the lock ends when the file is closed or the process dies. On
+    Windows there is no fcntl and this is a no-op: rebuilds from separate
+    processes are not serialised there, and search_cache still lists the
+    directory when manifest.json does not match it.
+    """
+    if fcntl is None:
+        yield
+        return
+    fd = os.open(os.path.join(cache_dir, MANIFEST_LOCK), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
 def _update_manifest(cache_dir: str) -> None:
     """Rebuild manifest.md (the table for people) and manifest.json (the same
-    rows, read by search_cache) from the files in cache_dir."""
-    rows = _manifest_rows(cache_dir)
-    pages = sum(1 for r in rows if r["status"] != "blocked")
-    out = ["# Web Cache Manifest\n\n",
-           "Cached pages available for re-querying with find_relevant_ranges.\n\n",
-           "| # | Title | URL | File | Fetched | Status | KB |\n",
-           "|---|---|---|---|---|---|---|\n"]
-    for i, r in enumerate(rows, 1):
-        title = f"(blocked: {r['reason']})" if r["status"] == "blocked" else r["title"]
-        out.append(f"| {i} | {_cell(title)} | {_cell(r['url'])} | {r['file']} | {r['fetched'][:10]} "
-                   f"| {r['status']} | {r['bytes'] / 1024:.1f} |\n")
-    out.append(f"\n**Total: {pages} pages cached, {len(rows) - pages} blocked.**\n")
-    _write_atomic(os.path.join(cache_dir, "manifest.md"), "".join(out))
-    _write_atomic(os.path.join(cache_dir, "manifest.json"), json.dumps(rows, indent=1, ensure_ascii=False) + "\n")
+    rows, read by search_cache) from the files in cache_dir, holding the
+    manifest lock from the directory listing to the last write."""
+    with _manifest_lock(cache_dir):
+        rows = _manifest_rows(cache_dir)
+        pages = sum(1 for r in rows if r["status"] != "blocked")
+        out = ["# Web Cache Manifest\n\n",
+               "Cached pages available for re-querying with find_relevant_ranges.\n\n",
+               "| # | Title | URL | File | Fetched | Status | KB |\n",
+               "|---|---|---|---|---|---|---|\n"]
+        for i, r in enumerate(rows, 1):
+            title = f"(blocked: {r['reason']})" if r["status"] == "blocked" else r["title"]
+            out.append(f"| {i} | {_cell(title)} | {_cell(r['url'])} | {r['file']} | {r['fetched'][:10]} "
+                       f"| {r['status']} | {r['bytes'] / 1024:.1f} |\n")
+        out.append(f"\n**Total: {pages} pages cached, {len(rows) - pages} blocked.**\n")
+        _write_atomic(os.path.join(cache_dir, "manifest.md"), "".join(out))
+        _write_atomic(os.path.join(cache_dir, "manifest.json"), json.dumps(rows, indent=1, ensure_ascii=False) + "\n")
 
 
 def _rebuild_manifest(cache_dir: str, results: list) -> None:
@@ -347,23 +384,49 @@ def _describe(error: Exception) -> str:
     return text if text.startswith(name) else f"{name}: {text}"
 
 
-def _jina_get(url: str, headers: dict) -> dict:
+def _jina_target(url: str) -> str:
+    """The URL as it is put into the Jina request: a non-ASCII host in IDNA
+    (punycode) form, and in the rest of the URL every space, control
+    character and non-ASCII character percent-encoded as UTF-8. A % that
+    does not start a %XX escape becomes %25. Other printable ASCII,
+    including existing escapes, is kept, so an ASCII URL without spaces is
+    sent as it was before. urllib refuses a request line with non-ASCII or
+    space characters, so such URLs could not be fetched at all. Raises
+    UnicodeError for a host IDNA cannot encode."""
+    scheme, sep, after = url.partition("://")
+    if not sep:
+        scheme, after = "", url
+    ends = [k for k in (after.find("/"), after.find("?"), after.find("#")) if k >= 0]
+    netloc, rest = after[:min(ends, default=len(after))], after[min(ends, default=len(after)):]
+    if not netloc.isascii():
+        userinfo, at, hostport = netloc.rpartition("@")
+        host, colon, port = hostport.partition(":")
+        netloc = (urllib.parse.quote(userinfo, safe=_URL_SAFE) + at + host.encode("idna").decode("ascii")
+                  + colon + port)
+    rest = urllib.parse.quote(re.sub(r"%(?![0-9A-Fa-f]{2})", "%25", rest), safe=_URL_SAFE)
+    return f"{scheme}{sep}{netloc}{rest}"
+
+
+def _jina_get(url: str, headers: dict, deadline: float) -> dict:
     """One Jina Reader request, retried once on a transient failure. Never raises.
 
     Transient: transport errors (URLError, timeouts, IncompleteRead,
     RemoteDisconnected and any other OSError or HTTPException) and HTTP 408,
     429 and 5xx. The retry waits for Retry-After (at most RETRY_AFTER_CAP_S)
-    or FETCH_BACKOFF_S. Returns {"text", "replacements", "attempts"} on
-    success, where replacements counts invalid UTF-8 sequences replaced by
-    U+FFFD; otherwise {"error", "detail", "http_status", "attempts"}, where
-    error names every attempt's failure.
+    or FETCH_BACKOFF_S. `deadline` (time.monotonic) bounds the whole call:
+    each request waits at most FETCH_TIMEOUT_S or the time left, and the
+    retry is sent only when at least FETCH_MIN_ATTEMPT_S is left after the
+    wait. Returns {"text", "replacements", "attempts"} on success, where
+    replacements counts invalid UTF-8 sequences replaced by U+FFFD;
+    otherwise {"error", "detail", "http_status", "attempts"}, where error
+    names every attempt's failure and why no retry was sent.
     """
     failures, code, detail = [], None, ""
     for attempt in range(1, FETCH_ATTEMPTS + 1):
         wait = FETCH_BACKOFF_S
         try:
-            req = urllib.request.Request(f"{JINA_BASE}/{url}", headers=headers)
-            with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT_S) as resp:
+            req = urllib.request.Request(f"{JINA_BASE}/{_jina_target(url)}", headers=headers)
+            with urllib.request.urlopen(req, timeout=min(FETCH_TIMEOUT_S, deadline - time.monotonic())) as resp:
                 raw = resp.read()
             text = raw.decode("utf-8", errors="replace")
             return {"text": text, "replacements": text.count("\ufffd") - raw.count(b"\xef\xbf\xbd"),
@@ -383,13 +446,46 @@ def _jina_get(url: str, headers: dict) -> dict:
             break
         except (OSError, http.client.HTTPException) as e:
             failures.append(_describe(e))
-        except Exception as e:  # a malformed URL (ValueError) or anything else: not transient, not retried
+        except Exception as e:  # a malformed URL (ValueError, UnicodeError) or anything else: not retried
             failures.append(_describe(e))
             break
         if attempt < FETCH_ATTEMPTS:
+            left = deadline - time.monotonic() - wait
+            if left < FETCH_MIN_ATTEMPT_S:
+                failures.append(f"not retried: {max(left, 0.0):.1f} s of the {FETCH_TOTAL_S:g} s allowed for "
+                                f"this URL would be left after the {wait:g} s wait")
+                break
             _sleep(wait)
-    error = failures[0] if len(failures) == 1 else "; ".join(f"attempt {k}: {f}" for k, f in enumerate(failures, 1))
-    return {"error": error, "detail": detail, "http_status": code, "attempts": len(failures)}
+    sent = len(failures) - (1 if failures[-1].startswith("not retried:") else 0)
+    if sent == 1:
+        error = "; ".join(failures)
+    else:
+        error = "; ".join(f"attempt {k}: {f}" for k, f in enumerate(failures, 1))
+    return {"error": error, "detail": detail, "http_status": code, "attempts": sent}
+
+
+def _remove_stale_parts(cache_dir: str) -> list:
+    """Remove .tmp-*.part files older than STALE_PART_S from cache_dir.
+
+    _write_atomic leaves one behind only when its process is killed while
+    writing; nothing reads it. Age is measured on the wall clock (file
+    times), so a file being written now is never removed. Returns a warning
+    for each file that could not be removed."""
+    warnings = []
+    try:
+        names = [n for n in os.listdir(cache_dir) if n.startswith(".tmp-") and n.endswith(".part")]
+    except OSError as e:
+        return [f"stale temporary files not checked: {type(e).__name__}: {e}"]
+    for name in names:
+        path = os.path.join(cache_dir, name)
+        try:
+            if time.time() - os.stat(path).st_mtime > STALE_PART_S:
+                os.remove(path)
+        except FileNotFoundError:  # another fetch removed it first
+            pass
+        except OSError as e:
+            warnings.append(f"stale temporary file {name} not removed: {type(e).__name__}: {e}")
+    return warnings
 
 
 def _freshness_problem(max_age_days, refresh) -> str:
@@ -436,6 +532,7 @@ def _fetch_into(url: str, cache_dir: str, max_age_days, refresh: bool, result: d
         result.update(reason=f"usage: {problem}", error=problem)
         return result
     os.makedirs(cache_dir, exist_ok=True)
+    result["warnings"].extend(_remove_stale_parts(cache_dir))
     h = _url_hash(url)
     page = os.path.join(cache_dir, f"{h}.md")
     sidecar = os.path.join(cache_dir, f"{h}.blocked.json")
@@ -469,7 +566,8 @@ def _fetch_into(url: str, cache_dir: str, max_age_days, refresh: bool, result: d
                 result["kept_path"] = old["path"]
             return result
 
-    first = _jina_get(url, _headers())
+    deadline = time.monotonic() + FETCH_TOTAL_S
+    first = _jina_get(url, _headers(), deadline)
     result["attempts"] = first["attempts"]
     if "error" in first:
         result.update(status="error", reason=first["error"], error=first["error"], detail=first["detail"],
@@ -480,9 +578,13 @@ def _fetch_into(url: str, cache_dir: str, max_age_days, refresh: bool, result: d
         return result
     text, replacements = first["text"], first["replacements"]
     status, reason = _classify_body(url, text)
-    if status in _BLOCKING:
+    left = deadline - time.monotonic()
+    if status in _BLOCKING and left < FETCH_MIN_ATTEMPT_S:
+        reason += (f"; the alternate request was not sent: {max(left, 0.0):.1f} s of the {FETCH_TOTAL_S:g} s "
+                   "allowed for this URL were left")
+    elif status in _BLOCKING:
         added = ", ".join(sorted(set(_alt_headers()) - set(_headers())))
-        alternate = _jina_get(url, _alt_headers())
+        alternate = _jina_get(url, _alt_headers(), deadline)
         result["attempts"] += alternate["attempts"]
         if "error" in alternate:
             reason += f"; the alternate request ({added}) failed: {alternate['error']}"
@@ -588,35 +690,52 @@ def batch_read_urls(urls: list[str], cache_dir: str = ".web_cache", max_age_days
     return json.dumps(_batch_read(urls, cache_dir, max_age_days, refresh))
 
 
-@mcp.tool()
-def list_cache(cache_dir: str = ".web_cache") -> str:
-    """List all cached web pages with their metadata.
-
-    Args:
-        cache_dir: Directory containing cached markdown files.
-    """
+def _list_cache(cache_dir: str):
+    """list_cache and `web-sieve list`. Never raises: a missing directory
+    gives [], a directory that cannot be listed gives an error object
+    instead of the list, and a page that cannot be read gives an entry with
+    error instead of its metadata. Invalid UTF-8 is replaced, not fatal."""
     if not os.path.isdir(cache_dir):
-        return json.dumps([])
-
+        return []
+    try:
+        names = sorted(os.listdir(cache_dir))
+    except OSError as e:
+        return {"cache_dir": os.path.abspath(cache_dir), "status": "error",
+                "error": {"kind": "unreadable", "message": f"{cache_dir}: {type(e).__name__}: {e}"}}
     entries = []
-    for fname in sorted(os.listdir(cache_dir)):
+    for fname in names:
         if not fname.endswith(".md"):
             continue
         fpath = os.path.join(cache_dir, fname)
         meta = {"path": os.path.abspath(fpath), "file": fname}
-        with open(fpath) as f:
-            for line in f:
-                if line.strip() == "---" and meta.get("url"):
-                    break
-                if line.startswith("url: "):
-                    meta["url"] = line[5:].strip()
-                elif line.startswith("title: "):
-                    meta["title"] = line[7:].strip()
-                elif line.startswith("fetched: "):
-                    meta["fetched"] = line[9:].strip()
+        try:
+            with open(fpath, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if line.strip() == "---" and meta.get("url"):
+                        break
+                    if line.startswith("url: "):
+                        meta["url"] = line[5:].strip()
+                    elif line.startswith("title: "):
+                        meta["title"] = line[7:].strip()
+                    elif line.startswith("fetched: "):
+                        meta["fetched"] = line[9:].strip()
+        except OSError as e:
+            meta = {"path": meta["path"], "file": fname,
+                    "error": {"kind": "unreadable", "message": f"{type(e).__name__}: {e}"}}
         entries.append(meta)
+    return entries
 
-    return json.dumps(entries)
+
+@mcp.tool()
+def list_cache(cache_dir: str = ".web_cache") -> str:
+    """List all cached web pages with their metadata.
+
+    Returns a JSON array with one object per .md file: path, file, url, title, fetched. A page that cannot be read has `error` instead of its metadata. A directory that cannot be listed gives an object with `status: "error"` and `error` instead of the array.
+
+    Args:
+        cache_dir: Directory containing cached markdown files.
+    """
+    return json.dumps(_list_cache(cache_dir))
 
 
 # ── Jev relevance ranges ─────────────────────────────────────────
@@ -629,11 +748,13 @@ def list_cache(cache_dir: str = ".web_cache") -> str:
 
 JEV_MODEL = "jev-1.13.0"          # pinned: the threshold is calibrated against one model version (docs)
 PROMPT_VERSION = 1                # increment on any change to instructions, criteria, state shape or text transform
-# Calibrated 2026-10-04 on 9 pages x 3 questions (calibration/data): at 0.85 line recall 0.967, precision 0.426,
-# no page misses, no false alarms on absent questions; 0.90 gave 0.923/0.530 but four gold windows scored 0.82
-# to 0.89 and batch-dependent shifts of up to 0.19 were measured, so 0.85 is the safer cut. Haiku baseline for
-# comparison: precision 0.864, recall 0.909, 9.5 s per page vs 0.32 s.
-DEFAULT_THRESHOLD = 0.85          # p >= threshold selects
+# Calibrated 2026-10-04 with jev-1.13.0 on 9 pages x 3 questions (calibration/data), run twice: the second run
+# replaced two pages from projects the deny list now refuses. At 0.80 line recall was 0.971 and 0.970, precision
+# 0.395 and 0.362, with no page misses and no false alarms on absent questions in either run. In the second run 0.85
+# lost gold windows scoring 0.81 and 0.82 (recall 0.940) and passed the Haiku recall check (0.960 - 0.02) by 0.0001;
+# with batch-dependent shifts of up to 0.19 measured, 0.80 is the safer cut. The spec 15.5 rule's own pick in that
+# run was 200-token windows at 0.80 (precision 0.503, recall 0.960); the window size is unchanged (README).
+DEFAULT_THRESHOLD = 0.80          # p >= threshold selects
 WINDOW_TOKENS = 400               # target window size (spec section 4); maximum 2x, minimum 1/5
 WINDOWS_PER_REQUEST = 16          # as jgrep and jevpdf (spec section 5)
 JEV_CONCURRENCY = 4               # requests in flight per call; under the published rate limits (docs, 2026-10-03)
@@ -718,17 +839,22 @@ def _load_jev():
     return module
 
 
-def _read_cached_page(path: str) -> tuple:
+def _read_cached_page(path: str, require_cache_dir: bool = True) -> tuple:
     """(lines, body_start, meta) of a web-sieve cache page (spec sections 3.3 and 4.1).
 
-    The real file must sit in a directory named .web_cache and start with
-    web-sieve frontmatter holding a url: line, so no other local file can be
-    sent to Jev. body_start is the 1-based line number of the first body line.
+    The file must start with web-sieve frontmatter holding a url: line, and,
+    with require_cache_dir, its real path must sit in a directory named
+    .web_cache. That name check is the privacy rule for Jev sends: it keeps
+    find_relevant_ranges and search_cache(jev=True) from sending any other
+    local file to TypeSafe. The lexical search index reads pages with
+    require_cache_dir=False, because nothing it reads leaves the machine and
+    a cache may sit in a directory with another name. body_start is the
+    1-based line number of the first body line.
     """
     real = os.path.realpath(path)
     if not os.path.isfile(real):
         raise _SourceError("not_found", f"no such file: {path}")
-    if os.path.basename(os.path.dirname(real)) != ".web_cache":
+    if require_cache_dir and os.path.basename(os.path.dirname(real)) != ".web_cache":
         raise _SourceError("not_a_cached_page", f"not inside a .web_cache directory: {path}")
     # newline="" and a split on \n only number lines as Read, sed and wc do:
     # a lone \r stays inside its line; the \r of a CRLF ending is removed.
@@ -1612,8 +1738,8 @@ class _SearchIndex:
             if row:
                 c.execute("DELETE FROM postings WHERE page = ?", (row[0],))
                 c.execute("DELETE FROM pages WHERE id = ?", (row[0],))
-            try:
-                lines, body_start, meta = _read_cached_page(path)
+            try:  # no .web_cache name check here: the index sends nothing to Jev (see _read_cached_page)
+                lines, body_start, meta = _read_cached_page(path, require_cache_dir=False)
             except _SourceError as e:
                 warnings.append(f"skipped {fname}: {e.kind}: {e.message}")
                 continue
@@ -2106,7 +2232,9 @@ def _cli():
         print(json.dumps(_batch_read(args.urls, args.cache_dir, args.max_age_days, args.refresh), indent=2))
 
     elif args.command == "list":
-        print(list_cache(args.cache_dir))
+        out = _list_cache(args.cache_dir)
+        print(json.dumps(out))
+        sys.exit(1 if isinstance(out, dict) else 0)
 
     elif args.command == "ranges":
         results = _relevance(args.question, args.sources, args.cache_dir, args.threshold,

@@ -26,6 +26,7 @@ The tool returns **metadata only** — content stays on disk until explicitly re
 - [Claude Code](https://claude.ai/claude-code) CLI
 - [uv](https://docs.astral.sh/uv/) (Python package runner)
 - A [Jina API key](https://jina.ai) (free tier available)
+- Optional, for `find_relevant_ranges` and `search_cache` with `jev`: a Jev client file and a TypeSafe API key (see [Jev relevance](#jev-relevance))
 
 ### Mac / Linux
 
@@ -65,12 +66,12 @@ Get-Content claude-md-snippet.md | Add-Content "$env:USERPROFILE\.claude\CLAUDE.
 |---|---|
 | `batch_read_urls` | Fetch multiple URLs in parallel, cache to disk, return metadata and a `status` per URL |
 | `read_url` | Fetch a single URL (same caching behavior) |
-| `list_cache` | List all cached pages with metadata |
+| `list_cache` | List all cached pages with metadata; a page it cannot read has `error`, and a directory it cannot list gives an error object |
 | `search_cache` | Search the pages already cached in a project (BM25 over windows, optional Jev rerank); returns files, scores and line ranges, never page text |
 | `find_relevant_ranges` | Find the line ranges of cached pages that help answer a question, using Jev; returns `status`, `relevant`, `ranges` and every window's probability per page |
 | `audit_cache` | Check a cache for challenge, empty and thin pages; with `apply`, quarantine the stubs |
 
-CLI equivalents: `web-sieve read`, `batch`, `list`, `search`, `ranges` and `audit` print the same JSON as the MCP tools.
+CLI equivalents: `uv run --script web-sieve.py read`, `batch`, `list`, `search`, `ranges` and `audit` print the same JSON as the MCP tools (the examples below write `web-sieve` for `uv run --script web-sieve.py`). With no arguments the file starts the MCP server.
 
 ## Fetching
 
@@ -98,7 +99,13 @@ Warnings also report Jina's own warnings (`jina: Target URL returned error 404: 
 
 ### Retry
 
-Transport errors (`URLError`, timeouts, `IncompleteRead`, `RemoteDisconnected`) and HTTP 408, 429 and 5xx are retried once, after the `Retry-After` header (seconds or an HTTP date, read as UTC; at most 30 s) or 2 s. A URL that urllib refuses before sending (a space or control character) is not retried. Two attempts in total; then `status: "error"` naming each attempt's failure. Other HTTP errors are not retried. No fetch raises: every failure is that URL's result, and the other URLs in a batch are unaffected.
+Transport errors (`URLError`, timeouts, `IncompleteRead`, `RemoteDisconnected`) and HTTP 408, 429 and 5xx are retried once, after the `Retry-After` header (seconds or an HTTP date, read as UTC; at most 30 s) or 2 s. Two attempts in total; then `status: "error"` naming each attempt's failure. Other HTTP errors are not retried, and neither is a URL that cannot be sent at all (a host with a space, or a host IDNA cannot encode). No fetch raises: every failure is that URL's result, and the other URLs in a batch are unaffected.
+
+Each URL has 200 s in total for all its requests and waits, including the alternate request below. A request waits at most 180 s for an answer, or less when less of the 200 s is left, and a retry or alternate request is sent only when at least 10 s would be left for it; otherwise the result says it was not sent and why. So a URL whose requests get no answer ends within 200 s. Before this cap the worst case was 362 s for the two attempts (two 180 s timeouts and the 2 s wait), and longer when a challenge led to the alternate request.
+
+### URLs
+
+The URL sent to Jina has a non-ASCII host in IDNA (punycode) form, and spaces, control characters and non-ASCII characters in the rest of the URL percent-encoded as UTF-8. Existing `%XX` escapes and other printable ASCII are sent as they are, and a `%` that does not start an escape becomes `%25`. The cache file name and the frontmatter `url:` keep the URL as given. On 2026-10-04 Jina fetched a Wikipedia article whose title has an accented letter and an IDNA test host this way; before, urllib refused such URLs without sending them.
 
 ### Alternate request for blocked pages
 
@@ -127,6 +134,7 @@ A repeat request for a blocked URL within 24 hours of the sidecar's time returns
 - BM25 (k1 = 1.2, b = 0.75) over the same windows `find_relevant_ranges` uses, tokenised as lower-cased `\w+`, with the page title's tokens counted twice in every window of the page.
 - Output: `status`, `pages` (the top `top_k`), each `{file, url, title, score, windows}`, where `windows` are the page's best three as `[start, end, score]` file line numbers for Read offset/limit; `index` (pages, windows, rebuilt, reused, removed); `warnings`. No page text.
 - Pages come from `manifest.json`; when it is missing or does not match the files on disk, the directory is listed instead, with a warning.
+- Any cache directory is searched, also one with another name or a `.web_cache` link to one, because the lexical search sends nothing anywhere. With `jev=True` only pages whose real directory is named `.web_cache` are sent; the others are reported as `not_a_cached_page`.
 - The index is `search_index.sqlite` in the cache directory. A page is windowed again only when its modification time or size changed and its sha256 changed too, so a repeat query on an unchanged cache only reads the index.
 - `jev=True` asks Jev about the top 20 windows (with the same state, Noul, answers cache, pinned model and fail-fast rule as `find_relevant_ranges`) and orders pages and windows by its probability; each window becomes `[start, end, score, p]` and each page gains `p`. The output adds `jev_requests`, `cache_hits`, `input_tokens` and `cost_usd`. A Jev failure gives `status` `partial` or `error` with `error.kind`, and the lexical ranking is still returned. The deny list applies (below).
 
@@ -185,30 +193,34 @@ A minimal config file:
 
 ### Threshold and calibration
 
-The default threshold is **0.85**, calibrated on 2026-10-04 with `jev-1.13.0` on 9 pages and 27 questions (a local, a spread and an absent question per page), at 400-token windows, 16 windows per request, link reduction on and no bridging:
+The default threshold is **0.80**, calibrated on 2026-10-04 with `jev-1.13.0` on 9 pages and 27 questions (a local, a spread and an absent question per page), at 400-token windows, 16 windows per request, link reduction on and no bridging. The calibration ran twice that day: the second run replaced two pages that came from projects the deny list now refuses with a GitHub repository page whose answer sits inside a 16,000-character line and a fund page.
 
-| Method | Line recall | Line precision | Time per page |
+| Method | Line recall (run 1 / run 2) | Line precision (run 1 / run 2) | Median time per page |
 |---|---|---|---|
-| Jev at 0.85 (chosen) | 0.967 | 0.426 | 0.32 s |
-| Jev at 0.90 | 0.923 | 0.530 | 0.32 s (the threshold is applied after the answers) |
-| Haiku triage (old recipe) | 0.909 | 0.864 | 9.5 s |
+| Jev at 0.80 (default) | 0.971 / 0.970 | 0.395 / 0.362 | 0.32 / 0.26 s |
+| Jev at 0.85 (default after run 1) | 0.967 / 0.940 | 0.426 / 0.420 | the same (the threshold is applied after the answers) |
+| Jev at 0.90 | 0.923 / 0.891 | 0.530 / 0.534 | the same |
+| Jev, 200-token windows at 0.80 | 0.962 / 0.960 | 0.535 / 0.503 | 0.32 s (run 2) |
+| Haiku triage (old recipe) | 0.909 / 0.960 | 0.864 / 0.788 | 9.5 s |
 
-At 0.85 no relevant page was missed and no absent question was answered with a range. 0.90 was more precise, but four gold windows scored between 0.82 and 0.89 and the same window's probability was measured to move by up to 0.19 when its batch changed, so 0.85 is the safer cut. The decision rule in section 15.5 of the spec passed (recall at least the Haiku recall minus 0.02, no page misses, time per page under 2 s), so `find_relevant_ranges` replaces the Haiku step. Its ranges are looser than Haiku's (precision 0.43 against 0.86), so expect to read about twice the lines Haiku would have chosen. Every window's probability is in the output, so a caller can apply another threshold without a new request.
+At 0.80 no relevant page was missed and no absent question was answered with a range, in either run. In run 2, 0.85 lost gold windows that scored 0.81 and 0.82, and it met the decision rule's recall condition (recall at least the Haiku recall minus 0.02) by 0.0001. The same window's probability was measured to move by up to 0.19 when its batch changed, so the default moved from 0.85 down to 0.80. The decision rule in section 15.5 of the spec passed in both runs (no page misses, time per page under 2 s), so `find_relevant_ranges` replaces the Haiku step. Its ranges are looser than Haiku's (precision about 0.36 to 0.40 against 0.79 to 0.86), so expect to read about twice the lines Haiku would have chosen. Every window's probability is in the output, so a caller can apply another threshold without a new request.
 
-Two pages of the calibration set come from projects that the deny list now refuses; a rerun of `calibrate.py` stops on them until they are replaced.
+The rule's own pick in run 2 was 200-token windows at 0.80, which had higher precision than the default 400-token windows in both runs at about the same recall. The window size was not changed with the threshold: a new size re-windows every page, so every cached Jev answer misses and `search_cache` ranks different windows. That is a separate decision.
 
 `calibration/calibrate.py` measures line-level precision and recall against labelled pages and applies the decision rule in section 15.5 of the spec. Its inputs and outputs live in `calibration/data/`, which is gitignored because the page list and the labels name private project directories. To run it:
 
 1. Write `calibration/data/pages.json` (`[{"n", "page", "title", "why"}]`, page paths relative to `~/Projects`). `uv run --script calibration/calibrate.py --check` then prints each page's sha256 and body line range for the labellers.
 2. Write `calibration/data/labels.jsonl`: one line per page from a Sonnet labeller, with a local, a spread and an absent question and their gold line ranges (format in the script's docstring). `--check` validates it.
 3. Write `calibration/data/haiku_baseline.jsonl`: the full output of one Haiku agent per question, given the old step-3 instruction. This is the baseline the tool must match.
-4. `uv run --script calibration/calibrate.py --one` sends one question as a smoke test. Then `gtimeout 900 uv run --script calibration/calibrate.py --configs all` runs the six configurations (about $0.21) and writes `calibration/data/results/YYYY-MM-DD.json` with every window's probability, the metrics and the decision. The run stops at the first page that is not `ok`.
+4. `uv run --script calibration/calibrate.py --one` sends one question as a smoke test. Then `gtimeout 1200 uv run --script calibration/calibrate.py --configs all` runs the six configurations (about $0.21) and writes `calibration/data/results/YYYY-MM-DD.json` with every window's probability, the metrics and the decision. The run stops at the first page that is not `ok`.
 
 ### Tests
 
 ```bash
-uv run pytest
+uv run --frozen pytest -q
 ```
+
+`--frozen` installs exactly what `uv.lock` records and never rewrites it. Without it, uv rewrites `uv.lock` whenever an exclude-newer cutoff set in the environment (`UV_EXCLUDE_NEWER`) has moved, even when no dependency changed.
 
 The tests use the real jev client and a local fake Jev server (`tests/fake_jev.py`, reached through `JEV_API_BASE`), and a local fake Jina Reader (`tests/fake_jina.py`, reached by setting `JINA_BASE`) that can serve normal, challenge and empty pages, 429 with `Retry-After`, 503, a body cut short, invalid UTF-8 and slow responses. No test uses the network. They fail, rather than skip, when the jev client cannot be loaded.
 
@@ -237,11 +249,14 @@ Other files in the cache directory:
 | File | What it holds |
 |---|---|
 | `manifest.md` | Table of every page and blocked URL: title, URL, file, fetched date, status, size in KB. Rebuilt on every fetch. |
+| `.manifest.lock` | Empty lock file. A rebuild of both manifests holds an exclusive lock on it (fcntl on POSIX), so two processes fetching into one cache cannot leave a stale `manifest.json`. On Windows there is no fcntl and rebuilds are not locked; `search_cache` still lists the directory when `manifest.json` does not match it. |
 | `manifest.json` | The same rows as `{file, url, title, fetched, status, bytes, lines}` (blocked rows add `reason`); read by `search_cache`. |
 | `<hash>.blocked.json` | Sidecar for a blocked URL (`url`, `status`, `reason`, `attempts`, `at`). |
 | `_quarantine/` | Pages moved by `audit --apply`, and `quarantine.jsonl`, one line per move. |
 | `jev_answers.sqlite` | Jev answer cache (hashes and probabilities only). |
 | `search_index.sqlite` | `search_cache` index: window line ranges and term counts per page. |
+
+Files are written through a temporary `.tmp-*.part` file and renamed into place. A process killed while writing leaves its temporary file behind; the next fetch into that cache removes any older than an hour.
 
 ## Performance
 
@@ -273,7 +288,7 @@ Jina's documentation (jina.ai/reader, read 2026-10-04) says its default extracti
 
 ## Docs
 
-See [docs/web-pipeline-explained.pdf](docs/web-pipeline-explained.pdf) for a detailed walkthrough with diagrams.
+See [docs/web-pipeline-explained.pdf](docs/web-pipeline-explained.pdf) for a walkthrough with diagrams. It describes the first version, which removed page parts with CSS selectors and triaged pages with Haiku agents; the design of the current version is in [docs/jev-relevance-spec.md](docs/jev-relevance-spec.md) and [docs/effectiveness-spec.md](docs/effectiveness-spec.md).
 
 ## License
 

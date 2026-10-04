@@ -470,7 +470,7 @@ def test_unreachable_endpoint_and_internal_failure_are_results_not_exceptions(ca
         raise RuntimeError("classifier exploded")
 
     monkeypatch.setattr(ws, "JINA_BASE", "http://127.0.0.1:9")
-    monkeypatch.setattr(ws, "_jina_get", lambda url, headers: {"text": "x", "replacements": 0, "attempts": 1})
+    monkeypatch.setattr(ws, "_jina_get", lambda url, headers, deadline: {"text": "x", "replacements": 0, "attempts": 1})
     monkeypatch.setattr(ws, "_classify_body", boom)
     out = json.loads(ws.batch_read_urls([URL], cache))
     assert out[0]["status"] == "error" and out[0]["reason"] == "RuntimeError: classifier exploded"
@@ -1543,12 +1543,16 @@ def test_deeply_nested_json_body_is_classified_not_raised(tmp_path):
     assert ws._audit(str(tmp_path / ".web_cache"))["counts"]["ok"] == 1
 
 
-def test_url_with_a_space_fails_once_without_a_retry(cache, jina, sleeps):
-    """urllib refuses a URL with a space before sending anything; that is
-    not transient, so there is no 2-second wait and no second attempt."""
-    r = ws._fetch("https://example.com/a b", cache)
+def test_url_with_a_space_in_the_host_fails_once_without_a_retry(cache, jina, sleeps):
+    """A space in the path is percent-encoded and fetched. A space in the
+    host cannot be encoded, and urllib refuses the request before sending
+    anything; that is not transient, so there is no 2-second wait and no
+    second attempt."""
+    r = ws._fetch("https://exa mple.com/a", cache)
     assert r["status"] == "error" and r["attempts"] == 1 and "InvalidURL" in r["reason"]
     assert sleeps == [] and jina.requests == []
+    r = ws._fetch("https://example.com/a b", cache)
+    assert r["status"] == "ok" and jina.requests[0]["path"] == "/https://example.com/a%20b"
 
 
 def test_sidecar_removed_by_a_concurrent_fetch_does_not_fail_this_fetch(cache, jina, clock, monkeypatch):
@@ -1571,3 +1575,168 @@ def test_sidecar_removed_by_a_concurrent_fetch_does_not_fail_this_fetch(cache, j
     monkeypatch.setattr(ws.os, "remove", real_remove)
     assert r["status"] == "ok" and os.path.exists(page_path(cache)) and not os.path.exists(sidecar_path(cache))
 
+
+# ── Findings fixed before the first push (2026-10-04) ─────────────
+
+
+def run_in_subprocess(code):
+    """Start a Python process that loads web-sieve.py as `ws` and runs `code`."""
+    script = ("from importlib.machinery import SourceFileLoader\n"
+              "from importlib.util import module_from_spec, spec_from_loader\n"
+              f"loader = SourceFileLoader('ws', {str(ROOT / 'web-sieve.py')!r})\n"
+              "ws = module_from_spec(spec_from_loader('ws', loader)); loader.exec_module(ws)\n" + code)
+    return subprocess.Popen([sys.executable, "-c", script], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+def test_manifest_rebuild_waits_for_the_lock_and_lists_the_directory_after_it(tmp_path):
+    """Two processes rebuilding one cache's manifests could each list the
+    directory, and the one that listed first could write last, leaving a
+    manifest.json without the other's pages. The rebuild holds an exclusive
+    lock on .manifest.lock from the listing to the last write, so a rebuild
+    started while another process holds the lock waits, and then lists the
+    pages written while it waited."""
+    cache = search_cache_dir(tmp_path)
+    lock = os.open(os.path.join(cache, ws.MANIFEST_LOCK), os.O_RDWR | os.O_CREAT)
+    ws.fcntl.flock(lock, ws.fcntl.LOCK_EX)
+    try:
+        proc = run_in_subprocess(f"ws._update_manifest({cache!r})\n")
+        time.sleep(1.0)
+        assert proc.poll() is None  # waiting for the lock, nothing listed or written yet
+        write_page(cache, "d.md", fj.FILLER * 3, title="Written while the rebuild waited")
+    finally:
+        os.close(lock)
+    assert proc.wait(timeout=60) == 0, proc.stderr.read()
+    rows = json.loads(Path(cache, "manifest.json").read_text())
+    assert sorted(r["file"] for r in rows) == ["a.md", "b.md", "c.md", "d.md"]
+    assert "d.md" in Path(cache, "manifest.md").read_text()
+
+
+def test_manifest_lock_is_a_no_op_without_fcntl(tmp_path, monkeypatch):
+    """Windows has no fcntl: the rebuild still works, without a lock or a lock file."""
+    monkeypatch.setattr(ws, "fcntl", None)
+    cache = tmp_path / ".web_cache"
+    write_page(cache, "a.md", fj.FILLER * 3)
+    ws._update_manifest(str(cache))
+    assert [r["file"] for r in json.loads(Path(cache, "manifest.json").read_text())] == ["a.md"]
+    assert not Path(cache, ws.MANIFEST_LOCK).exists()
+
+
+def test_search_indexes_a_cache_directory_with_another_name(tmp_path, jevserver):
+    """search_cache returned zero pages when the cache directory, or the
+    target of a .web_cache link, had another name. The lexical index sends
+    nothing anywhere, so it reads such a directory; the .web_cache rule
+    still guards Jev sends, so jev=True sends nothing from it."""
+    store = tmp_path / "page_store"
+    write_page(store, "z.md", sections(["[[p=0.9]] The zebra crossing rules."]), title="Zebras")
+    out = ws._search("zebra", str(store))
+    assert out["status"] == "ok" and [p["file"] for p in out["pages"]] == ["z.md"]
+    assert not any(w.startswith("skipped") for w in out["warnings"])
+    link = tmp_path / "proj" / ".web_cache"
+    link.parent.mkdir()
+    link.symlink_to(store)
+    assert [p["file"] for p in ws._search("zebra", str(link))["pages"]] == ["z.md"]
+    out = ws._search("zebra", str(store), jev=True)
+    assert out["status"] == "error" and out["error"]["kind"] == "not_a_cached_page" and jevserver.requests == []
+    assert [p["file"] for p in out["pages"]] == ["z.md"]
+
+
+@pytest.mark.parametrize("url, sent", [
+    ("https://de.wikipedia.org/wiki/Café", "https://de.wikipedia.org/wiki/Caf%C3%A9"),
+    ("https://bücher.example/straße?q=ä#teil", "https://xn--bcher-kva.example/stra%C3%9Fe?q=%C3%A4#teil"),
+    ("https://user@bücher.example:8080/a", "https://user@xn--bcher-kva.example:8080/a"),
+    ("https://example.com/a b?c=d e", "https://example.com/a%20b?c=d%20e"),
+    ("https://example.com/100%/x%41?y=[1]&z=(2)", "https://example.com/100%25/x%41?y=[1]&z=(2)"),
+    ("https://example.com/plain/path?q=1&r=2", "https://example.com/plain/path?q=1&r=2"),
+], ids=["accented-path", "idna-host-path-query", "idna-host-userinfo-port", "spaces", "escapes-kept", "ascii-unchanged"])
+def test_target_url_is_percent_encoded_with_an_idna_host(url, sent):
+    """urllib refuses a request line with non-ASCII or space characters, so
+    such URLs could never be fetched. The host goes to IDNA, the rest is
+    percent-encoded as UTF-8, existing escapes are kept, and a plain ASCII
+    URL is sent exactly as before."""
+    assert ws._jina_target(url) == sent
+
+
+def test_non_ascii_urls_reach_jina_encoded_and_are_cached_under_the_original_url(cache, jina):
+    """The cache file name and frontmatter keep the URL the caller gave, so a
+    repeat request finds the page; only the request to Jina is encoded."""
+    url = "https://bücher.example/straße"
+    r = ws._fetch(url, cache)
+    assert r["status"] == "ok" and jina.requests[0]["path"] == "/https://xn--bcher-kva.example/stra%C3%9Fe"
+    assert r["path"] == page_path(cache, url) and ws._frontmatter(Path(r["path"]).read_text())[0]["url"] == url
+    assert ws._fetch(url, cache)["status"] == "cached" and len(jina.requests) == 1
+    bad = ws._fetch("https://" + "ü" * 70 + ".example/", cache)
+    assert bad["status"] == "error" and "UnicodeError" in bad["reason"] and len(jina.requests) == 1
+
+
+def test_stale_part_files_are_removed_at_the_start_of_a_fetch(cache, jina):
+    """A process killed in _write_atomic leaves a .tmp-*.part file that
+    nothing reads. A fetch removes those older than an hour and keeps a
+    younger one, which may be a write in progress."""
+    os.makedirs(cache)
+    old, young = Path(cache, ".tmp-old.part"), Path(cache, ".tmp-young.part")
+    for p in (old, young):
+        p.write_text("half a manifest")
+    hour_ago = time.time() - ws.STALE_PART_S - 60
+    os.utime(old, (hour_ago, hour_ago))
+    other = Path(cache, "notes.part")
+    other.write_text("not a temporary file of web-sieve")
+    os.utime(other, (hour_ago, hour_ago))
+    r = ws._fetch(URL, cache)
+    assert r["status"] == "ok" and not old.exists() and young.exists() and other.exists()
+    old.write_text("again")
+    os.utime(old, (hour_ago, hour_ago))
+    assert ws._fetch(URL, cache)["status"] == "cached" and not old.exists()  # also when no request is sent
+
+
+def test_list_cache_reports_unreadable_pages_and_directories_instead_of_raising(tmp_path, monkeypatch, capsys):
+    """list_cache raised on an unreadable page or directory and on invalid
+    UTF-8. A page it cannot read is an entry with an error, a directory it
+    cannot list is an error object (CLI exit 1), and bad bytes are replaced."""
+    cache = tmp_path / ".web_cache"
+    write_page(cache, "good.md", fj.FILLER * 3, url="https://example.com/good")
+    bad = Path(write_page(cache, "bad.md", fj.FILLER * 3))
+    Path(cache, "latin.md").write_bytes(b"---\nurl: https://example.com/l\ntitle: caf\xe9\n---\nbody\n")
+    bad.chmod(0)
+    try:
+        entries = {e["file"]: e for e in json.loads(ws.list_cache(str(cache)))}
+    finally:
+        bad.chmod(0o644)
+    assert entries["good.md"]["url"] == "https://example.com/good" and "error" not in entries["good.md"]
+    assert entries["bad.md"]["error"]["kind"] == "unreadable" and "PermissionError" in entries["bad.md"]["error"]["message"]
+    assert entries["latin.md"]["title"] == "caf�"
+    cache.chmod(0o333)
+    try:
+        out = json.loads(ws.list_cache(str(cache)))
+        code, via_cli = cli(monkeypatch, capsys, "list", "--cache-dir", str(cache))
+    finally:
+        cache.chmod(0o755)
+    assert out["status"] == "error" and out["error"]["kind"] == "unreadable" and via_cli == out and code == 1
+    assert json.loads(ws.list_cache(str(tmp_path / "nowhere"))) == []
+
+
+def test_hung_url_stops_within_the_per_url_time_cap(cache, jina, monkeypatch, sleeps):
+    """A URL that never answers cost two full timeouts and the wait between
+    them (about 362 s with the 180 s timeout). The whole URL now gets
+    FETCH_TOTAL_S: the retry waits only for the time left, and is not sent
+    when too little is left; the alternate request for a challenge is
+    skipped the same way. Shortened caps stand in for 200 s here."""
+    monkeypatch.setattr(ws, "FETCH_TIMEOUT_S", 0.6)
+    monkeypatch.setattr(ws, "FETCH_TOTAL_S", 1.0)
+    monkeypatch.setattr(ws, "FETCH_MIN_ATTEMPT_S", 0.2)
+    monkeypatch.setattr(ws, "FETCH_BACKOFF_S", 0.05)
+    jina.default = {"delay": 3.0}
+    started = time.monotonic()
+    r = ws._fetch(URL, cache)
+    assert time.monotonic() - started < 1.0 + 0.3 and len(jina.requests) == 2
+    assert r["status"] == "error" and r["attempts"] == 2 and r["reason"].count("timed out") == 2
+    monkeypatch.setattr(ws, "FETCH_TOTAL_S", 0.7)
+    started = time.monotonic()
+    r = ws._fetch(URL2, cache)
+    assert time.monotonic() - started < 0.7 + 0.3 and len(jina.requests) == 3
+    assert r["status"] == "error" and r["attempts"] == 1 and "not retried" in r["reason"] and sleeps == [0.05]
+    monkeypatch.setattr(ws, "FETCH_TIMEOUT_S", 2.0)
+    monkeypatch.setattr(ws, "FETCH_MIN_ATTEMPT_S", 0.3)
+    jina.default = {"delay": 0.5, "body": fj.CHALLENGE}  # answers within the cap, with under 0.3 s left
+    r = ws._fetch("https://example.com/third", cache)
+    assert r["status"] == "blocked" and r["attempts"] == 1 and len(jina.requests) == 4
+    assert "the alternate request was not sent" in r["reason"]

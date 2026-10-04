@@ -4,3 +4,11 @@ __pycache__/
 calibration/data/
 .venv/
 .pytest_cache/
+.atlas/
+*.part
+.manifest.lock
+search_index.sqlite
+jev_answers.sqlite
+/Web-Sieve.pdf
+/web-pipeline-explained.md
+/web-pipeline-explained.pdf

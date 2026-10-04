@@ -7,6 +7,9 @@ dependencies = [
     "mcp[cli]<2",
 ]
 
+# Run the tests with `uv run --frozen pytest -q`. --frozen installs exactly what uv.lock records and
+# never rewrites it. Without it, uv rewrites uv.lock whenever an exclude-newer cutoff set in the
+# environment (UV_EXCLUDE_NEWER) has moved, even when no dependency changed.
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 

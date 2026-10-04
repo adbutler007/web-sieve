@@ -23,7 +23,7 @@ public and the page list and labels name private project directories.
 Usage:
     uv run --script calibration/calibrate.py --check     # pages and labels only; no Jev requests
     uv run --script calibration/calibrate.py --one       # smoke test: one pair, C1
-    gtimeout 900 uv run --script calibration/calibrate.py --configs all
+    gtimeout 1200 uv run --script calibration/calibrate.py --configs all
 
 The run stops at the first result whose status is not ok, writes what it
 has to the output file and exits 1. Answers are cached in each page's
@@ -194,8 +194,8 @@ def histogram(runs: list, pairs: list, pages: dict) -> dict:
 def haiku_prediction(record: dict, page: dict) -> tuple:
     """(selected lines, relevant, parsed) from a Haiku agent's full output."""
     text = record.get("output", "").strip()
-    if text.startswith("```"):
-        text = text.strip("`").removeprefix("json").strip()
+    if text.startswith("```"):  # the first fenced block; an agent may add prose after it
+        text = text[3:].split("```", 1)[0].removeprefix("json").strip()
     try:
         parsed = json.loads(text)
         ranges = [[int(a), int(b)] for a, b in parsed.get("ranges", [])]

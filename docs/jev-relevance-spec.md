@@ -459,10 +459,12 @@ Nine cached pages chosen to cover page types and the windowing edge cases. The l
 | 3 | Central bank research note | 277 lines, 45k chars | research note with numbers |
 | 4 | Finance blog post | 954 lines, 61k chars, 64 headings | blog with navigation and link lists |
 | 5 | Podcast transcript | 625 lines, 110k chars, no headings | transcript; blank-line windows only |
-| 6 | GitHub repository page | 278 lines, 79k chars, one 18,823-char line | split-line case |
+| 6 | GitHub repository page (replaced 2026-10-04) | 252 lines, 55k chars, lines of 16,015 and 16,075 chars | split-line case |
 | 7 | Central bank working paper (PDF) | 645 lines, 98k chars, lines up to 5,438 chars | PDF-derived text with long lines |
 | 8 | Index methodology rules | 2,994 lines, 111k chars, 50 headings | long rules document, short lines |
-| 9 | Fund product page | 997 lines, 37k chars, 19 setext headings | fund page; setext headings |
+| 9 | Fund product page (replaced 2026-10-04) | 651 lines, 41k chars, no setext headings | fund page |
+
+Pages 6 and 9 were replaced on 2026-10-04 because their projects joined the Jev deny list; the first page 6 had one 18,823-character line, and the first page 9 had 19 setext headings. No fund page outside denied projects has setext headings (only two cached pages outside them have eight or more), so the set no longer contains a setext-heading page. Setext windowing stays covered by the unit tests.
 
 Pages from projects on the Jev deny list were excluded, and so were caches that hold research about individual people.
 
