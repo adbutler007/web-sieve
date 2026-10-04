@@ -7,13 +7,15 @@ An MCP server for Claude Code that fetches web pages as clean markdown, caches t
 ## How it works
 
 ```
-WebSearch → batch_read_urls → .web_cache/ → Haiku agents → Read ranges
+WebSearch → search_cache → batch_read_urls → .web_cache/ → find_relevant_ranges (Jev) → Read ranges
+                                    └─ blocked → Firecrawl
 ```
 
 1. **WebSearch** (built-in) discovers URLs and returns summaries
-2. **batch_read_urls** fetches all pages in parallel (8 threads) via [Jina Reader](https://r.jina.ai), rendered in Jina's headless browser with images kept, and caches clean markdown to `{project}/.web_cache/`
-3. **Parallel Haiku agents** scan each cached page and return structured JSON with relevant line ranges
-4. **Read** pulls only those ranges into the main context
+2. **search_cache** looks for the answer in pages the project has already cached (BM25, no network)
+3. **batch_read_urls** fetches the pages that are missing, in parallel (8 threads), via [Jina Reader](https://r.jina.ai), checks each response with a quality gate, and caches real pages as markdown in `{project}/.web_cache/`. A bot-challenge or empty response is not cached: it comes back as `status: "blocked"` with `fallback: "firecrawl"`
+4. **find_relevant_ranges** asks [Jev](https://docs.typesafe.ai) one yes/no question per window of each cached page and returns the relevant line ranges, with every window's probability
+5. **Read** pulls only those ranges into the main context
 
 The tool returns **metadata only** — content stays on disk until explicitly requested.
 
@@ -61,11 +63,154 @@ Get-Content claude-md-snippet.md | Add-Content "$env:USERPROFILE\.claude\CLAUDE.
 
 | Tool | Purpose |
 |---|---|
-| `batch_read_urls` | Fetch multiple URLs in parallel, cache to disk, return metadata |
+| `batch_read_urls` | Fetch multiple URLs in parallel, cache to disk, return metadata and a `status` per URL |
 | `read_url` | Fetch a single URL (same caching behavior) |
 | `list_cache` | List all cached pages with metadata |
+| `search_cache` | Search the pages already cached in a project (BM25 over windows, optional Jev rerank); returns files, scores and line ranges, never page text |
+| `find_relevant_ranges` | Find the line ranges of cached pages that help answer a question, using Jev; returns `status`, `relevant`, `ranges` and every window's probability per page |
+| `audit_cache` | Check a cache for challenge, empty and thin pages; with `apply`, quarantine the stubs |
 
-The same file is a command line tool: `uv run --script web-sieve.py read URL`, `... batch URL ...` and `... list`, each with `--cache-dir`, print the same metadata as JSON (`read --print` prints the cached markdown instead). With no arguments it starts the MCP server.
+CLI equivalents: `web-sieve read`, `batch`, `list`, `search`, `ranges` and `audit` print the same JSON as the MCP tools.
+
+## Fetching
+
+### Quality gate and statuses
+
+Every Jina response is classified before it is cached. The Jina preamble (`Title:`, `URL Source:`, `Published Time:`, `Number of Pages:` (PDFs), `Warning:` lines and `Markdown Content:`) is removed first; the rest is the body.
+
+| Class | Rule | What happens |
+|---|---|---|
+| `challenge` | The title contains (ignoring case) one of: "Just a moment", "Attention Required", "Access denied", "Verify you are human", "Checking your browser", "Enable JavaScript and cookies", "Please wait while we verify", "Security check", "cf-browser-verification", "captcha", "Request blocked", "403 Forbidden", "Error 1020", "unusual traffic"; or the body is under 3,000 characters and its first 2,000 characters contain one of them ("captcha" only when the body is under 400 characters) | Alternate request, then `blocked` |
+| `empty` | The body is under 20 characters, or it is a Jina error object (`{"code": 451, "name": ..., "message": ...}`) served with status 200 | Alternate request, then `blocked` |
+| `thin` | The body is under 400 characters and is not a challenge | Cached, with `status: thin` in the frontmatter and a warning, because small legitimate files exist |
+| `ok` | Anything else | Cached |
+
+Jina's own `Warning:` lines are not used as evidence of a challenge: its "maybe requiring CAPTCHA" warning also appears on real pages that only contain a form with a CAPTCHA widget. For the same reason a phrase in the body of a page of 3,000 characters or more is page text, and "captcha" in the body counts only on a thin body: on 2026-10-04 every body mention of "captcha" in 1,575 cached pages was a form field or a cookie notice (one, a 750-character contact page, had been quarantined by the first version of the rule and was restored), while all 52 real challenge pages matched in the title and had bodies of 388 characters or less.
+
+Every result from `read_url` and `batch_read_urls` has `status`, `reason`, `warnings`, `attempts`, `cached` and `refreshed`:
+
+- `cached`: served from the cache with no request; `page_status` is the page's frontmatter status (`ok` for pages written before the quality gate).
+- `ok` or `thin`: fetched and cached. A thin page carries a `thin page:` warning.
+- `blocked`: a challenge or empty response, also after the alternate request. No page is written; a sidecar `<hash>.blocked.json` (`url`, `status`, `reason`, `attempts`, `at`) is, and the result carries `fallback: "firecrawl"`. **Fetch a blocked URL with Firecrawl instead.**
+- `error`: the request failed; `error`, `detail` and `http_status` say how.
+
+Warnings also report Jina's own warnings (`jina: Target URL returned error 404: Not Found`) and invalid UTF-8 (`decode_replacements: n`; the bytes are replaced, not fatal).
+
+### Retry
+
+Transport errors (`URLError`, timeouts, `IncompleteRead`, `RemoteDisconnected`) and HTTP 408, 429 and 5xx are retried once, after the `Retry-After` header (seconds or an HTTP date, read as UTC; at most 30 s) or 2 s. A URL that urllib refuses before sending (a space or control character) is not retried. Two attempts in total; then `status: "error"` naming each attempt's failure. Other HTTP errors are not retried. No fetch raises: every failure is that URL's result, and the other URLs in a batch are unaffected.
+
+### Alternate request for blocked pages
+
+A `challenge` or `empty` response is fetched once more with:
+
+- `X-No-Cache: true`, which bypasses Jina's own cache (it may hold an earlier blocked response), and
+- `X-Proxy: auto`, which routes the request through Jina's proxy pool, **only when `JINA_API_KEY` is set**, because the jina-ai/reader README says the proxy needs a key.
+
+Both headers are documented on [jina.ai/reader](https://jina.ai/reader) (parameter list) and in the [jina-ai/reader README](https://github.com/jina-ai/reader) ("Having trouble on some websites?"), read 2026-10-04. `X-Engine: browser`, the README's other suggestion, is already on every request. No other header is sent; `X-Proxy-Url` (your own proxy) is documented but needs a proxy URL, so it is not used. On 2026-10-04 Jina answered a request with both headers normally (HTTP 200), and an SSRN abstract page was still a Cloudflare challenge after the alternate request, so it ended as `blocked`.
+
+A repeat request for a blocked URL within 24 hours of the sidecar's time returns the sidecar with no request sent. After 24 hours the URL is fetched again and the sidecar is replaced (by a page on success, or by a new sidecar).
+
+### Freshness
+
+`read_url`, `batch_read_urls` and `find_relevant_ranges` take `max_age_days` (default none) and `refresh` (default false); the CLI flags are `--max-age-days D` and `--refresh`.
+
+- By default a cached page never expires, as before.
+- With `max_age_days`, a page whose `fetched:` time is older than that is fetched again.
+- `refresh` fetches again regardless, and ignores a blocked sidecar.
+- A refetch overwrites the page and reports `refreshed: true`. When a refetch fails or is blocked, the old copy is kept and named in `kept_path`.
+
+## search_cache
+
+`search_cache(query, cache_dir, top_k=10, jev=False)` (CLI: `web-sieve search "QUERY" --cache-dir DIR [--top-k N] [--jev]`) finds material the project has already cached, without a network call.
+
+- BM25 (k1 = 1.2, b = 0.75) over the same windows `find_relevant_ranges` uses, tokenised as lower-cased `\w+`, with the page title's tokens counted twice in every window of the page.
+- Output: `status`, `pages` (the top `top_k`), each `{file, url, title, score, windows}`, where `windows` are the page's best three as `[start, end, score]` file line numbers for Read offset/limit; `index` (pages, windows, rebuilt, reused, removed); `warnings`. No page text.
+- Pages come from `manifest.json`; when it is missing or does not match the files on disk, the directory is listed instead, with a warning.
+- The index is `search_index.sqlite` in the cache directory. A page is windowed again only when its modification time or size changed and its sha256 changed too, so a repeat query on an unchanged cache only reads the index.
+- `jev=True` asks Jev about the top 20 windows (with the same state, Noul, answers cache, pinned model and fail-fast rule as `find_relevant_ranges`) and orders pages and windows by its probability; each window becomes `[start, end, score, p]` and each page gains `p`. The output adds `jev_requests`, `cache_hits`, `input_tokens` and `cost_usd`. A Jev failure gives `status` `partial` or `error` with `error.kind`, and the lexical ranking is still returned. The deny list applies (below).
+
+## audit
+
+`web-sieve audit <cache_dir> [--apply | --dry-run]` (MCP: `audit_cache(cache_dir, apply=False)`) classifies every cached page with the quality gate.
+
+- The default (also `--dry-run`) changes nothing and reports counts per class and the challenge and empty pages.
+- `--apply` moves challenge and empty pages to `<cache_dir>/_quarantine/` (never deletes them), appends one JSON line per move to `_quarantine/quarantine.jsonl`, writes a blocked sidecar for each URL dated at the page's `fetched:` time (so the next fetch after 24 hours from that time goes to the network rather than to the stub), adds `status: thin` to the frontmatter of thin pages, and rebuilds `manifest.md` and `manifest.json`. Adding that line moves the thin page's later lines down by one.
+- `ok` pages are never written. A second run moves nothing.
+
+## Jev relevance
+
+`find_relevant_ranges` (CLI: `web-sieve ranges`) replaces the Haiku triage step. It splits the body of each cached page into windows of about 400 tokens, breaking before headings and at blank lines and never inside a code block or table below the 800-token maximum. It asks TypeSafe's Jev one yes/no question per window ("does this window help answer the question?") and returns the line ranges of the windows whose probability is at or above the threshold. Jev cannot return line ranges, so the windows and the ranges are computed in code. The design is in [docs/jev-relevance-spec.md](docs/jev-relevance-spec.md).
+
+### Requirements
+
+- **The jev client.** web-sieve loads a standard-library Jev client file named `jev` (it must define `ask`, `resolve_key`, `POLICIES` and the client's error classes) with importlib, from `WEB_SIEVE_JEV` when that is set, else `jev` on `PATH`, else `~/.local/bin/jev`. It is not vendored: other users need their own copy and can point `WEB_SIEVE_JEV` at it. Without it, `find_relevant_ranges` returns `status: "error"` with `kind: "no_client"`; the fetch tools are unaffected.
+- **A TypeSafe API key.** The client reads `JEV_API_KEY` from the environment, else the macOS Keychain item with service `JEV_API_KEY` (`security find-generic-password -s JEV_API_KEY -w`), else `secret-tool` on Linux. The key is never printed, logged, returned or stored.
+
+### Usage
+
+```bash
+web-sieve ranges "What are the rate limits?" /abs/project/.web_cache/199f6b071e6b.md [MORE PAGES OR URLS] \
+    [--cache-dir DIR] [--threshold T] [--window-tokens N] [--max-windows N]
+```
+
+The output is a JSON list with one object per source, in input order: `status` (`ok`, `partial` or `error`), `relevant`, `ranges` (`[[start, end], ...]`, 1-based file line numbers for Read offset/limit), `range_detail`, `windows` (`[start, end, p]` for every window), `split_lines`, `long_lines`, `unjudged`, `requests`, `cache_hits`, `input_tokens`, `cost_usd`, `elapsed_ms`, `jev_events` (every retry, hedge and give-up) and `warnings`. A page whose `status` is not `ok` was not fully judged: `relevant` is `null` unless a judged window passed, and `unjudged` lists the lines Jev did not judge. Such a page must not be treated as irrelevant.
+
+CLI exit codes: 0 when every page is `ok`; 4 no key; 2 usage error or client error (401, 422); 5 malformed answer; 3 gave up after retries; 1 any other per-page error. When several apply, the first in the order 4, 2, 5, 3, 1 wins.
+
+### What is sent to TypeSafe
+
+The question, the page title (or its URL when the title is empty), and the text and section headings of each window, with link targets removed. File paths, line numbers, frontmatter and other pages are not sent. Only files inside a `.web_cache/` directory that start with web-sieve frontmatter are accepted, so no other local file can be sent. Do not put credentials or private data in the question. TypeSafe states that Jev is not trained on customer requests; zero data retention is offered only to enterprise customers.
+
+### Deny list
+
+Pages from some projects are never sent to Jev. `find_relevant_ranges` returns `status: "denied"` (with `reason`, `error.kind: "denied"` and the whole body in `unjudged`) for such a page and sends nothing for it; `search_cache(jev=True)` returns `status: "denied"` with the lexical results only.
+
+- A cache directory is denied when a component of its path, as given or with symlinks resolved, equals a listed name or starts with `<name>-wt-` (a git worktree of that project), ignoring case. A name ending in `*` matches any component that starts with the part before the `*`. For a page path, both the given directory and the directory of the file a symlink points to are checked.
+- The names are read from `privacy.deny_projects` in `~/.claude/jev_hooks/config.json`, the config file that other Jev hooks on the machine also read, so one list governs every Jev send. Entries of `privacy.deny_path_prefixes`, when present, deny every path under them. web-sieve.py itself names no project except the generic built-in names `clients`, `client_data` and `client-data`, which are always denied.
+- When that file is missing, does not parse, or has no `privacy.deny_projects` list, only the built-in names are denied, and every result that sends pages to Jev (`find_relevant_ranges`, and `search_cache` with `jev`) carries a warning that starts `deny_list: not configured`.
+
+A minimal config file:
+
+```json
+{"privacy": {"deny_projects": ["private_notes", "clients_*"], "deny_path_prefixes": ["~/Documents/private"]}}
+```
+
+### Behaviour
+
+- The model is pinned to `jev-1.13.0`, because the threshold is calibrated against one model version. A different served model is kept and reported in `warnings`.
+- 16 windows per request, 4 requests in flight, and the jev client's `default` retry policy (3 attempts within 20 s). web-sieve adds no retries of its own. After the first client error, malformed answer or give-up, no further request is sent in that call.
+- Answers are cached in `jev_answers.sqlite` in the page's `.web_cache/` directory, keyed by model, prompt version, question, window and batch. The file holds hashes, probabilities, the served model and timestamps; it holds no page text, question or key. A repeated call sends no requests, and a rerun after a failure pays only for the batches that failed. Delete the file to clear it.
+- Pages with more windows than `max_windows` (default 1,000) are refused before any request is sent.
+
+### Threshold and calibration
+
+The default threshold is **0.85**, calibrated on 2026-10-04 with `jev-1.13.0` on 9 pages and 27 questions (a local, a spread and an absent question per page), at 400-token windows, 16 windows per request, link reduction on and no bridging:
+
+| Method | Line recall | Line precision | Time per page |
+|---|---|---|---|
+| Jev at 0.85 (chosen) | 0.967 | 0.426 | 0.32 s |
+| Jev at 0.90 | 0.923 | 0.530 | 0.32 s (the threshold is applied after the answers) |
+| Haiku triage (old recipe) | 0.909 | 0.864 | 9.5 s |
+
+At 0.85 no relevant page was missed and no absent question was answered with a range. 0.90 was more precise, but four gold windows scored between 0.82 and 0.89 and the same window's probability was measured to move by up to 0.19 when its batch changed, so 0.85 is the safer cut. The decision rule in section 15.5 of the spec passed (recall at least the Haiku recall minus 0.02, no page misses, time per page under 2 s), so `find_relevant_ranges` replaces the Haiku step. Its ranges are looser than Haiku's (precision 0.43 against 0.86), so expect to read about twice the lines Haiku would have chosen. Every window's probability is in the output, so a caller can apply another threshold without a new request.
+
+Two pages of the calibration set come from projects that the deny list now refuses; a rerun of `calibrate.py` stops on them until they are replaced.
+
+`calibration/calibrate.py` measures line-level precision and recall against labelled pages and applies the decision rule in section 15.5 of the spec. Its inputs and outputs live in `calibration/data/`, which is gitignored because the page list and the labels name private project directories. To run it:
+
+1. Write `calibration/data/pages.json` (`[{"n", "page", "title", "why"}]`, page paths relative to `~/Projects`). `uv run --script calibration/calibrate.py --check` then prints each page's sha256 and body line range for the labellers.
+2. Write `calibration/data/labels.jsonl`: one line per page from a Sonnet labeller, with a local, a spread and an absent question and their gold line ranges (format in the script's docstring). `--check` validates it.
+3. Write `calibration/data/haiku_baseline.jsonl`: the full output of one Haiku agent per question, given the old step-3 instruction. This is the baseline the tool must match.
+4. `uv run --script calibration/calibrate.py --one` sends one question as a smoke test. Then `gtimeout 900 uv run --script calibration/calibrate.py --configs all` runs the six configurations (about $0.21) and writes `calibration/data/results/YYYY-MM-DD.json` with every window's probability, the metrics and the decision. The run stops at the first page that is not `ok`.
+
+### Tests
+
+```bash
+uv run pytest
+```
+
+The tests use the real jev client and a local fake Jev server (`tests/fake_jev.py`, reached through `JEV_API_BASE`), and a local fake Jina Reader (`tests/fake_jina.py`, reached by setting `JINA_BASE`) that can serve normal, challenge and empty pages, 429 with `Retry-After`, 503, a body cut short, invalid UTF-8 and slow responses. No test uses the network. They fail, rather than skip, when the jev client cannot be loaded.
 
 ## Cache format
 
@@ -77,13 +222,26 @@ url: https://example.com/article
 title: Article Title
 fetched: 2026-02-15T10:30:00+00:00
 hash: a1b2c3d4e5f6
+status: ok
+bytes: 18234
 ---
 [clean markdown content]
 ```
 
-Cache is **permanent and project-scoped** — pages persist across sessions and can be re-queried with different questions.
+`status` (`ok` or `thin`) and `bytes` (UTF-8 size of the text after the frontmatter) are written on pages fetched since 2026-10-04; a page without `status` is treated as `ok`.
 
-A `manifest.md` file is auto-generated in the cache directory on every fetch, listing all cached pages in a markdown table. Reference it from your `CLAUDE.md` so Claude knows what's cached even after context compaction.
+Cache is **project-scoped** and, by default, **permanent** — pages persist across sessions and can be re-queried with different questions (see Freshness to refetch).
+
+Other files in the cache directory:
+
+| File | What it holds |
+|---|---|
+| `manifest.md` | Table of every page and blocked URL: title, URL, file, fetched date, status, size in KB. Rebuilt on every fetch. |
+| `manifest.json` | The same rows as `{file, url, title, fetched, status, bytes, lines}` (blocked rows add `reason`); read by `search_cache`. |
+| `<hash>.blocked.json` | Sidecar for a blocked URL (`url`, `status`, `reason`, `attempts`, `at`). |
+| `_quarantine/` | Pages moved by `audit --apply`, and `quarantine.jsonl`, one line per move. |
+| `jev_answers.sqlite` | Jev answer cache (hashes and probabilities only). |
+| `search_index.sqlite` | `search_cache` index: window line ranges and term counts per page. |
 
 ## Performance
 
@@ -93,22 +251,22 @@ A `manifest.md` file is auto-generated in the cache directory on every fetch, li
 | Comparison | 3 | 29K chars | 8.5K chars | **70%** |
 | Broad research | 5 | 83K chars | 10.5K chars | **87%** |
 
-Haiku triage runs in parallel — latency is ~3-5s regardless of page count.
+Relevance with Jev (`jev-1.13.0`, measured 2026-10-03): a 73,000-character docs page in 53 windows went out as 4 parallel requests, 25,030 input tokens ($0.00105), 0.5 s (design probe). An 11,600-character page in 12 windows took 1 request, 5,334 input tokens ($0.00022), 0.5 s (this implementation). A repeated call is answered from the answers cache with no requests. In the 2026-10-04 calibration Jev took 0.32 s per page and the Haiku triage it replaces 9.5 s.
 
 ## What gets stripped
 
 web-sieve sends no CSS selectors (no `X-Remove-Selector` or `X-Target-Selector`), so what is removed is what Jina Reader's own extraction removes. Every request carries:
 
 - `Accept: text/markdown`
-- `X-Engine: browser`: Jina renders the page in headless Chrome, so client-side JavaScript runs before extraction. On the pages tested this fixed truncation of long pages and kept inline chart captions, source lines and disclaimer text.
+- `X-Engine: browser`: Jina renders the page in headless Chrome, so client-side JavaScript runs before extraction.
 - `X-Retain-Images: all`: image markdown (`![alt](url)`) is kept, so figure placement, chart captions and source lines stay next to their images in the cached page.
 - `Authorization: Bearer <JINA_API_KEY>` when the key is set.
 
-Jina's documentation (jina.ai/reader) says its default extraction strips boilerplate such as navigation, headers, footers and ads and converts the main content to markdown. Links are kept as `[text](url)`. A request waits up to 180 s.
+Jina's documentation (jina.ai/reader, read 2026-10-04) says its default extraction strips boilerplate such as navigation, headers, footers and ads and converts the main content to markdown. Links are kept as `[text](url)`. The cached file keeps links and images as Jina returned them; `find_relevant_ranges` and `search_cache` reduce `![alt](url)` to `[image: alt]` and `[text](url)` to `text` only in the window text they judge or index, not in the file.
 
 ## Limitations
 
-- **Cloudflare-protected sites** (Medium, HN) may return challenge pages. Skip these.
+- **Cloudflare-protected sites** (SSRN, Medium, some publishers) often return challenge pages even after the alternate request. They come back as `status: "blocked"`; fetch them with Firecrawl.
 - **Nav-heavy sites** may still have navigation in the cached page: Jina's extraction does not remove all of it, and web-sieve sends no selectors of its own.
 - **Restart required** after editing `web-sieve.py` — restart Claude Code to apply changes.
 - **`cache_dir` must be absolute** — the MCP server's working directory may differ from your project.

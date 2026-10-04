@@ -1,6 +1,6 @@
 # Jev relevance ranges for web-sieve: build specification
 
-Written 2026-10-03. Status: implemented 2026-10-03; the threshold is not yet calibrated. Every file change it describes is listed in section 18.
+Written 2026-10-03. Status: implemented 2026-10-03; the threshold was calibrated on 2026-10-04 (README, "Threshold and calibration"). Every file change it describes is listed in section 18.
 
 ## 0. Purpose and terms
 

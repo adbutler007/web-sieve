@@ -75,7 +75,10 @@ def fakebin(tmp_path):
 
 
 @pytest.fixture(autouse=True)
-def env(monkeypatch, jev, server, fakebin):
+def env(monkeypatch, tmp_path, jev, server, fakebin):
+    config = tmp_path / "deny_config.json"  # an empty deny list, so no test reads the machine's own config
+    config.write_text(json.dumps({"version": 1, "privacy": {"deny_projects": [], "deny_path_prefixes": []}}))
+    monkeypatch.setattr(ws, "DENY_CONFIG", str(config))
     monkeypatch.setenv("JEV_API_KEY", KEY)
     monkeypatch.setenv("JEV_API_BASE", server.url)
     monkeypatch.setenv("PATH", f"{fakebin}{os.pathsep}{os.environ['PATH']}")

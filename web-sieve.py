@@ -14,12 +14,14 @@ import re
 import shutil
 import sqlite3
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 from mcp.server.fastmcp import FastMCP
 
@@ -60,132 +62,530 @@ def _extract_title(content: str) -> str:
     return "Unknown"
 
 
-def _update_manifest(cache_dir: str) -> None:
-    """Rebuild manifest.md from all cached files."""
-    manifest_path = os.path.join(cache_dir, "manifest.md")
-    entries = []
+# ── Fetch: quality gate, retry, alternate strategy, freshness ─────
+#
+# Every Jina response is classified before it is cached. A challenge or
+# empty response is retried once with an alternate strategy and, if it is
+# still not content, recorded in a <hash>.blocked.json sidecar instead of a
+# page, so a blocked site is never cached as a clean page.
+# Specification: docs/effectiveness-spec.md, sections 1 to 4.
+
+JINA_BASE = "https://r.jina.ai"     # Reader endpoint; the tests point it at tests/fake_jina.py
+FETCH_TIMEOUT_S = 180               # seconds per Jina request (unchanged from the first version)
+FETCH_ATTEMPTS = 2                  # one retry for transport errors and HTTP 408, 429 and 5xx (spec section 2)
+FETCH_BACKOFF_S = 2.0               # wait before the retry when the response has no Retry-After
+RETRY_AFTER_CAP_S = 30.0            # longest Retry-After honoured
+BLOCKED_TTL_S = 24 * 3600           # a blocked sidecar answers repeat requests without a network call for this long
+EMPTY_CHARS = 20                    # a body under this many characters is empty
+THIN_CHARS = 400                    # a body under this many characters is thin (cached, with a warning)
+CHALLENGE_SCAN_CHARS = 2_000        # body characters searched for challenge phrases
+CHALLENGE_BODY_MAX_CHARS = 3_000    # a phrase in the body counts only when the body is shorter than this
+# "captcha" in the body counts only on a thin body. Real pages name the widget in forms and cookie
+# notices: on 2026-10-04 all 8 body mentions in 1,575 cached pages were real content (one a 750-character
+# contact form), while all 52 real challenge pages matched in the title and had bodies of 388 characters or less.
+CAPTCHA_BODY_MAX_CHARS = THIN_CHARS
+CHALLENGE_PHRASES = ("Just a moment", "Attention Required", "Access denied", "Verify you are human",
+                     "Checking your browser", "Enable JavaScript and cookies", "Please wait while we verify",
+                     "Security check", "cf-browser-verification", "captcha", "Request blocked", "403 Forbidden",
+                     "Error 1020", "unusual traffic")
+# The alternate request for a challenge or empty response. Both headers are documented in the
+# jina.ai/reader parameter list and in the jina-ai/reader README section "Having trouble on some
+# websites?" (both read 2026-10-04): X-No-Cache bypasses Jina's own cache, which may hold an
+# earlier blocked response; X-Proxy: auto routes the request through Jina's proxy pool, which the
+# README says needs an API key, so it is sent only when JINA_API_KEY is set.
+ALT_HEADERS = {"X-No-Cache": "true"}
+ALT_PROXY_HEADERS = {"X-Proxy": "auto"}
+_PREAMBLE_PREFIXES = ("Title:", "URL Source:", "Published Time:", "Number of Pages:", "Warning:")
+_RETRY_HTTP = (408, 429)
+_BLOCKING = ("challenge", "empty")
+
+
+def _sleep(seconds: float) -> None:
+    """time.sleep under a module name the tests can replace."""
+    time.sleep(seconds)
+
+
+def _now() -> float:
+    """Seconds since the epoch, under a module name the tests can replace to move the clock."""
+    return time.time()
+
+
+def _iso(epoch: float) -> str:
+    """UTC ISO 8601 time, in the format of the frontmatter fetched: field."""
+    return datetime.fromtimestamp(epoch, timezone.utc).isoformat()
+
+
+def _epoch(value) -> float | None:
+    """Seconds since the epoch of an ISO 8601 time (UTC when it has no zone), or None when it does not parse."""
+    try:
+        moment = datetime.fromisoformat(str(value).strip())
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.timestamp()
+
+
+def _alt_headers() -> dict[str, str]:
+    """Headers of the alternate request: the normal headers plus X-No-Cache, and X-Proxy only with an API key."""
+    return {**_headers(), **ALT_HEADERS, **(ALT_PROXY_HEADERS if API_KEY else {})}
+
+
+def _jina_parts(text: str) -> tuple:
+    """(title, warnings, body) of a Jina Reader response.
+
+    The preamble is the leading run of Title:, URL Source:, Published Time:,
+    Number of Pages: (a PDF) and Warning: lines and blank lines, ending with the Markdown Content:
+    line when there is one; the body is everything after it. Jina's
+    Warning: lines are returned separately and are not challenge evidence:
+    its "maybe requiring CAPTCHA" warning also appears on real pages that
+    hold a form with a CAPTCHA widget (127 cached pages had it on 2026-10-04).
+    """
+    lines = text.split("\n")
+    title, warnings, i = "", [], 0
+    while i < len(lines):
+        line = lines[i].rstrip("\r")
+        if line.startswith("Markdown Content:"):
+            i += 1
+            break
+        if line.strip() and not line.startswith(_PREAMBLE_PREFIXES):
+            break
+        if line.startswith("Title:"):
+            title = line[6:].strip()
+        elif line.startswith("Warning:"):
+            warnings.append(line[8:].strip())
+        i += 1
+    return title, warnings, "\n".join(lines[i:])
+
+
+def _classify_body(url: str, body: str) -> tuple:
+    """(status, reason) of a Jina Reader response (spec section 1).
+
+    The preamble is removed first (_jina_parts). challenge: the title holds
+    one of CHALLENGE_PHRASES, or the body is under CHALLENGE_BODY_MAX_CHARS
+    characters and its first CHALLENGE_SCAN_CHARS characters hold one
+    ("captcha" only on a body under CAPTCHA_BODY_MAX_CHARS), ignoring case;
+    a long page that merely mentions a phrase is content. empty: the body
+    is under EMPTY_CHARS characters after stripping whitespace, or is Jina's
+    own error object ({"code": 400 or more, "name", "message"}). thin: under
+    THIN_CHARS and not a challenge. ok: anything else. reason names the
+    phrase or the size and is empty for ok. The url is not used by these
+    rules; it is in the signature so that a rule for one site can be added
+    without changing the callers.
+    """
+    title, _, text = _jina_parts(body)
+    text = text.strip()
+    if text.startswith("{"):  # Jina's own error object ({"code": 451, "name": ..., "message": ...}) is not the page
+        try:
+            err = json.loads(text)
+        except (ValueError, RecursionError):  # not JSON, or nested too deep to be an error object
+            err = None
+        if (isinstance(err, dict) and type(err.get("code")) is int and err["code"] >= 400
+                and isinstance(err.get("name"), str) and ("message" in err or "readableMessage" in err)):
+            return "empty", f"empty: the body is a Jina error ({err['code']} {err['name']}), not page text"
+    checks = [("the title", title.lower(), CHALLENGE_PHRASES)]
+    if len(text) < CHALLENGE_BODY_MAX_CHARS:
+        checks.append((f"the first {CHALLENGE_SCAN_CHARS:,} body characters", text[:CHALLENGE_SCAN_CHARS].lower(),
+                       [p for p in CHALLENGE_PHRASES if p != "captcha" or len(text) < CAPTCHA_BODY_MAX_CHARS]))
+    for where, haystack, phrases in checks:
+        for phrase in phrases:
+            if phrase.lower() in haystack:
+                return "challenge", f"challenge: {phrase!r} in {where}"
+    if len(text) < EMPTY_CHARS:
+        return "empty", f"empty: the body is {len(text)} characters"
+    if len(text) < THIN_CHARS:
+        return "thin", f"thin: the body is {len(text)} characters"
+    return "ok", ""
+
+
+def _frontmatter(content: str) -> tuple:
+    """(fields, rest) of a cache file: the key: value lines between the opening
+    --- line and the next --- line, and the text after that line. A file
+    without frontmatter gives ({}, content). The first value of a key wins."""
+    lines = content.split("\n")
+    if not lines or lines[0].rstrip("\r") != "---":
+        return {}, content
+    for k in range(1, len(lines)):
+        if lines[k].rstrip("\r") == "---":
+            fields = {}
+            for line in lines[1:k]:
+                key, sep, value = line.rstrip("\r").partition(":")
+                if sep:
+                    fields.setdefault(key.strip(), value.strip())
+            return fields, "\n".join(lines[k + 1:])
+    return {}, content
+
+
+def _read_text(path: str) -> str:
+    """The file as text, with invalid UTF-8 replaced and line endings kept as they are."""
+    with open(path, encoding="utf-8", errors="replace", newline="") as f:
+        return f.read()
+
+
+def _write_atomic(path: str, text: str, mode: int = 0o644) -> None:
+    """Write text through a temporary file in the same directory and os.replace,
+    so a reader never sees a partial file."""
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".", prefix=".tmp-", suffix=".part")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _read_sidecar(path: str):
+    """The record in a <hash>.blocked.json sidecar; None when the file is
+    missing; {} when it exists but is not a JSON object."""
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            record = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return record if isinstance(record, dict) else {}
+
+
+def _file_lines(content: str) -> int:
+    """Lines of a file as Read numbers them: split on \\n, a final newline ends the last line."""
+    return content.count("\n") + (1 if content and not content.endswith("\n") else 0)
+
+
+def _manifest_rows(cache_dir: str) -> list:
+    """One row per cached page and per blocked sidecar, in file-name order.
+
+    A page row is {file, url, title, fetched, status, bytes, lines}: status
+    is the frontmatter status: field, or ok for a page written before the
+    quality gate; bytes is the UTF-8 size of the text after the frontmatter;
+    lines counts file lines as Read numbers them. A sidecar row has status
+    blocked, the sidecar's at time as fetched, 0 bytes and 0 lines, and also
+    its reason.
+    """
+    rows = []
     for fname in sorted(os.listdir(cache_dir)):
-        if not fname.endswith(".md") or fname == "manifest.md":
-            continue
         fpath = os.path.join(cache_dir, fname)
-        meta = {"file": fname}
-        with open(fpath) as f:
-            for line in f:
-                if line.strip() == "---" and meta.get("url"):
-                    break
-                if line.startswith("url: "):
-                    meta["url"] = line[5:].strip()
-                elif line.startswith("title: "):
-                    meta["title"] = line[7:].strip()
-                elif line.startswith("fetched: "):
-                    meta["fetched"] = line[9:].strip()
-        entries.append(meta)
-    with open(manifest_path, "w") as f:
-        f.write("# Web Cache Manifest\n\n")
-        f.write("Cached pages available for re-querying with find_relevant_ranges.\n\n")
-        f.write(f"| # | Title | URL | File | Fetched |\n")
-        f.write(f"|---|---|---|---|---|\n")
-        for i, e in enumerate(entries, 1):
-            title = e.get("title", "Unknown")
-            url = e.get("url", "")
-            fname = e.get("file", "")
-            fetched = e.get("fetched", "")[:10]
-            f.write(f"| {i} | {title} | {url} | {fname} | {fetched} |\n")
-        f.write(f"\n**Total: {len(entries)} pages cached.**\n")
+        if not os.path.isfile(fpath):
+            continue
+        if fname.endswith(".blocked.json"):
+            record = _read_sidecar(fpath) or {}
+            rows.append({"file": fname, "url": str(record.get("url", "")), "title": "",
+                         "fetched": str(record.get("at", "")), "status": "blocked", "bytes": 0, "lines": 0,
+                         "reason": str(record.get("reason", "")) if record else "sidecar is not readable JSON"})
+        elif fname.endswith(".md") and fname != "manifest.md":
+            content = _read_text(fpath)
+            fields, rest = _frontmatter(content)
+            size = fields.get("bytes", "")
+            rows.append({"file": fname, "url": fields.get("url", ""), "title": fields.get("title", "Unknown"),
+                         "fetched": fields.get("fetched", ""), "status": fields.get("status") or "ok",
+                         "bytes": int(size) if size.isdecimal() else len(rest.encode("utf-8")),
+                         "lines": _file_lines(content)})
+    return rows
 
 
-def _fetch_one(url: str, cache_dir: str) -> dict:
-    """Fetch a single URL, cache it, return metadata dict."""
+def _cell(text: str) -> str:
+    """Text safe inside a markdown table cell."""
+    return str(text).replace("|", "\\|").replace("\n", " ")
+
+
+def _update_manifest(cache_dir: str) -> None:
+    """Rebuild manifest.md (the table for people) and manifest.json (the same
+    rows, read by search_cache) from the files in cache_dir."""
+    rows = _manifest_rows(cache_dir)
+    pages = sum(1 for r in rows if r["status"] != "blocked")
+    out = ["# Web Cache Manifest\n\n",
+           "Cached pages available for re-querying with find_relevant_ranges.\n\n",
+           "| # | Title | URL | File | Fetched | Status | KB |\n",
+           "|---|---|---|---|---|---|---|\n"]
+    for i, r in enumerate(rows, 1):
+        title = f"(blocked: {r['reason']})" if r["status"] == "blocked" else r["title"]
+        out.append(f"| {i} | {_cell(title)} | {_cell(r['url'])} | {r['file']} | {r['fetched'][:10]} "
+                   f"| {r['status']} | {r['bytes'] / 1024:.1f} |\n")
+    out.append(f"\n**Total: {pages} pages cached, {len(rows) - pages} blocked.**\n")
+    _write_atomic(os.path.join(cache_dir, "manifest.md"), "".join(out))
+    _write_atomic(os.path.join(cache_dir, "manifest.json"), json.dumps(rows, indent=1, ensure_ascii=False) + "\n")
+
+
+def _rebuild_manifest(cache_dir: str, results: list) -> None:
+    """_update_manifest, with a failure added to every result's warnings instead of raised."""
+    try:
+        _update_manifest(cache_dir)
+    except OSError as e:
+        for r in results:
+            r.setdefault("warnings", []).append(f"manifest not rebuilt: {type(e).__name__}: {e}")
+
+
+def _retry_after(headers) -> float:
+    """Seconds to wait before a retry: the Retry-After header (seconds or an
+    HTTP date), from 0 to RETRY_AFTER_CAP_S; FETCH_BACKOFF_S without one."""
+    value = headers.get("Retry-After") if headers is not None else None
+    if not value:
+        return FETCH_BACKOFF_S
+    try:
+        seconds = float(value)
+    except ValueError:
+        try:
+            moment = parsedate_to_datetime(value)
+            if moment.tzinfo is None:  # the zone -0000 means UTC (RFC 5322); naive would be read as local time
+                moment = moment.replace(tzinfo=timezone.utc)
+            seconds = moment.timestamp() - _now()
+        except (TypeError, ValueError, IndexError, OverflowError):
+            return FETCH_BACKOFF_S
+    if not math.isfinite(seconds):
+        return FETCH_BACKOFF_S
+    return min(max(seconds, 0.0), RETRY_AFTER_CAP_S)
+
+
+def _describe(error: Exception) -> str:
+    """Class name and text of an exception, without repeating the name when the text already starts with it."""
+    name, text = type(error).__name__, str(error)
+    return text if text.startswith(name) else f"{name}: {text}"
+
+
+def _jina_get(url: str, headers: dict) -> dict:
+    """One Jina Reader request, retried once on a transient failure. Never raises.
+
+    Transient: transport errors (URLError, timeouts, IncompleteRead,
+    RemoteDisconnected and any other OSError or HTTPException) and HTTP 408,
+    429 and 5xx. The retry waits for Retry-After (at most RETRY_AFTER_CAP_S)
+    or FETCH_BACKOFF_S. Returns {"text", "replacements", "attempts"} on
+    success, where replacements counts invalid UTF-8 sequences replaced by
+    U+FFFD; otherwise {"error", "detail", "http_status", "attempts"}, where
+    error names every attempt's failure.
+    """
+    failures, code, detail = [], None, ""
+    for attempt in range(1, FETCH_ATTEMPTS + 1):
+        wait = FETCH_BACKOFF_S
+        try:
+            req = urllib.request.Request(f"{JINA_BASE}/{url}", headers=headers)
+            with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT_S) as resp:
+                raw = resp.read()
+            text = raw.decode("utf-8", errors="replace")
+            return {"text": text, "replacements": text.count("\ufffd") - raw.count(b"\xef\xbf\xbd"),
+                    "attempts": attempt}
+        except urllib.error.HTTPError as e:
+            code = e.code
+            try:
+                detail = e.read().decode("utf-8", errors="replace")
+            except Exception as read_error:  # a broken error body must not hide the status code
+                detail = f"(error body not readable: {type(read_error).__name__})"
+            failures.append(f"HTTP {e.code}: {e.reason}")
+            if e.code not in _RETRY_HTTP and not 500 <= e.code <= 599:
+                break
+            wait = _retry_after(e.headers)
+        except http.client.InvalidURL as e:  # a space or control character in the URL: a retry cannot help
+            failures.append(_describe(e))
+            break
+        except (OSError, http.client.HTTPException) as e:
+            failures.append(_describe(e))
+        except Exception as e:  # a malformed URL (ValueError) or anything else: not transient, not retried
+            failures.append(_describe(e))
+            break
+        if attempt < FETCH_ATTEMPTS:
+            _sleep(wait)
+    error = failures[0] if len(failures) == 1 else "; ".join(f"attempt {k}: {f}" for k, f in enumerate(failures, 1))
+    return {"error": error, "detail": detail, "http_status": code, "attempts": len(failures)}
+
+
+def _freshness_problem(max_age_days, refresh) -> str:
+    """The problem with the freshness arguments, or an empty string."""
+    if max_age_days is not None and (isinstance(max_age_days, bool) or not isinstance(max_age_days, (int, float))
+                                     or not math.isfinite(max_age_days) or max_age_days < 0):
+        return f"max_age_days must be a number of at least 0, or null, not {max_age_days!r}"
+    if not isinstance(refresh, bool):
+        return f"refresh must be true or false, not {refresh!r}"
+    return ""
+
+
+def _fetch(url: str, cache_dir: str, max_age_days: float | None = None, refresh: bool = False) -> dict:
+    """Fetch one URL through Jina Reader into cache_dir; return its metadata, never raise.
+
+    Every result has url, status, reason, warnings, attempts (Jina requests
+    sent), cached and refreshed. status is one of:
+    - cached: the page was already in cache_dir and fresh enough; no request.
+      page_status is its frontmatter status (ok when the page has none).
+    - ok or thin: fetched and written; refreshed is true when it replaced a
+      cached page. A thin page is cached with a warning.
+    - blocked: a challenge or empty response, also after the alternate
+      request; no page was written, a <hash>.blocked.json sidecar was, and
+      fallback is "firecrawl". Within BLOCKED_TTL_S of the sidecar's time a
+      repeat request returns it with no request sent.
+    - error: the request failed (error, detail, http_status).
+    With max_age_days set, a cached page older than that is fetched again;
+    refresh=True fetches again regardless and ignores a sidecar. When a
+    refetch fails, the cached copy is kept and named in kept_path.
+    """
+    result = {"url": url, "status": "error", "reason": "", "warnings": [], "attempts": 0,
+              "cached": False, "refreshed": False}
+    try:
+        return _fetch_into(url, cache_dir, max_age_days, refresh, result)
+    except Exception as e:  # never raises: an unexpected failure is this URL's error, with its class and text
+        message = f"{type(e).__name__}: {e}"
+        result.update(status="error", reason=message, error=message)
+        return result
+
+
+def _fetch_into(url: str, cache_dir: str, max_age_days, refresh: bool, result: dict) -> dict:
+    problem = _freshness_problem(max_age_days, refresh)
+    if problem:
+        result.update(reason=f"usage: {problem}", error=problem)
+        return result
     os.makedirs(cache_dir, exist_ok=True)
     h = _url_hash(url)
-    cache_file = os.path.join(cache_dir, f"{h}.md")
+    page = os.path.join(cache_dir, f"{h}.md")
+    sidecar = os.path.join(cache_dir, f"{h}.blocked.json")
+    old = None
+    if os.path.exists(page):
+        content = _read_text(page)
+        fields, body = _frontmatter(content)
+        fetched_at = _epoch(fields.get("fetched", ""))
+        old = {"path": os.path.abspath(page), "fetched": fields.get("fetched", "")}
+        fresh = max_age_days is None or (fetched_at is not None and _now() - fetched_at <= max_age_days * 86400)
+        if fresh and not refresh:
+            page_status = fields.get("status") or "ok"
+            result.update(status="cached", cached=True, page_status=page_status, path=old["path"],
+                          title=fields.get("title", "Unknown"), lines=body.count("\n") + 1, chars=len(body))
+            if page_status == "thin":
+                size = len(_jina_parts(body)[2].strip())
+                result["warnings"].append(f"thin page: the body is {size} characters; it may be a stub")
+            return result
 
-    # Return cached version if exists
-    if os.path.exists(cache_file):
-        with open(cache_file) as f:
-            content = f.read()
-        title = "Unknown"
-        for line in content.split("\n"):
-            if line.startswith("title: "):
-                title = line[7:].strip()
-                break
-        body_start = content.find("\n---\n")
-        body = content[body_start + 5:] if body_start != -1 else content
-        return {
-            "cached": True,
-            "path": os.path.abspath(cache_file),
-            "url": url,
-            "title": title,
-            "lines": body.count("\n") + 1,
-            "chars": len(body),
-        }
+    record = None if refresh else _read_sidecar(sidecar)
+    if record == {}:
+        result["warnings"].append(f"sidecar {sidecar} is not readable JSON; fetched again")
+    elif record is not None:
+        at = _epoch(record.get("at", ""))
+        if at is not None and 0 <= _now() - at < BLOCKED_TTL_S:
+            result.update(status="blocked", reason=str(record.get("reason", "")), fallback="firecrawl",
+                          sidecar=os.path.abspath(sidecar), blocked_at=record.get("at"))
+            result["warnings"].append(f"blocked at {record.get('at')}; no request is sent for this URL until "
+                                      "24 hours after that, unless refresh is true")
+            if old:
+                result["kept_path"] = old["path"]
+            return result
 
+    first = _jina_get(url, _headers())
+    result["attempts"] = first["attempts"]
+    if "error" in first:
+        result.update(status="error", reason=first["error"], error=first["error"], detail=first["detail"],
+                      http_status=first["http_status"])
+        if old:
+            result["kept_path"] = old["path"]
+            result["warnings"].append(f"the cached copy fetched {old['fetched']} was kept")
+        return result
+    text, replacements = first["text"], first["replacements"]
+    status, reason = _classify_body(url, text)
+    if status in _BLOCKING:
+        added = ", ".join(sorted(set(_alt_headers()) - set(_headers())))
+        alternate = _jina_get(url, _alt_headers())
+        result["attempts"] += alternate["attempts"]
+        if "error" in alternate:
+            reason += f"; the alternate request ({added}) failed: {alternate['error']}"
+        else:
+            status2, reason2 = _classify_body(url, alternate["text"])
+            if status2 in _BLOCKING:
+                reason += f"; the alternate request ({added}) gave {reason2}"
+            else:
+                result["warnings"].append(f"the first response was {reason}; this page came from the "
+                                          f"alternate request ({added})")
+                text, replacements, status, reason = alternate["text"], alternate["replacements"], status2, reason2
+    if status in _BLOCKING:
+        _write_atomic(sidecar, json.dumps({"url": url, "status": "blocked", "reason": reason,
+                                           "attempts": result["attempts"], "at": _iso(_now())}, indent=1) + "\n")
+        result.update(status="blocked", reason=reason, fallback="firecrawl", sidecar=os.path.abspath(sidecar))
+        if old:
+            result["kept_path"] = old["path"]
+            result["warnings"].append(f"the cached copy fetched {old['fetched']} was kept")
+        return result
+
+    title = _extract_title(text)
+    _write_atomic(page, f"---\nurl: {url}\ntitle: {title}\nfetched: {_iso(_now())}\nhash: {h}\n"
+                        f"status: {status}\nbytes: {len(text.encode('utf-8'))}\n---\n" + text)
     try:
-        req = urllib.request.Request(f"https://r.jina.ai/{url}", headers=_headers())
-        with urllib.request.urlopen(req, timeout=180) as resp:
-            body = resp.read().decode("utf-8")
-    except urllib.error.HTTPError as e:
-        err_body = e.read().decode("utf-8", errors="replace")
-        return {"url": url, "error": f"{e.code}: {e.reason}", "detail": err_body}
+        os.remove(sidecar)
+    except FileNotFoundError:  # none, or a concurrent fetch of the same URL removed it first
+        pass
+    result["warnings"][:0] = [f"jina: {w}" for w in _jina_parts(text)[1]]
+    if status == "thin":
+        result["warnings"].append(f"thin page: {reason[6:]}; it may be a stub")
+    if replacements > 0:
+        result["warnings"].append(f"decode_replacements: {replacements}")
+    result.update(status=status, reason=reason, refreshed=old is not None, path=os.path.abspath(page),
+                  title=title, lines=text.count("\n") + 1, chars=len(text))
+    return result
 
-    title = _extract_title(body)
-    now = datetime.now(timezone.utc).isoformat()
 
-    with open(cache_file, "w") as f:
-        f.write(f"---\nurl: {url}\ntitle: {title}\nfetched: {now}\nhash: {h}\n---\n")
-        f.write(body)
+def _fetch_one(url: str, cache_dir: str, max_age_days: float | None = None, refresh: bool = False) -> dict:
+    """The first version's name for _fetch. _relevance resolves URL sources
+    through this name, and the relevance tests replace it with a stub."""
+    return _fetch(url, cache_dir, max_age_days, refresh)
 
-    return {
-        "cached": False,
-        "path": os.path.abspath(cache_file),
-        "url": url,
-        "title": title,
-        "lines": body.count("\n") + 1,
-        "chars": len(body),
-    }
+
+def _read_url(url: str, cache_dir: str, max_age_days=None, refresh: bool = False) -> dict:
+    """read_url and `web-sieve read`: fetch one URL and rebuild the manifests unless the fetch failed."""
+    result = _fetch(url, cache_dir, max_age_days, refresh)
+    if result["status"] != "error":
+        _rebuild_manifest(cache_dir, [result])
+    return result
+
+
+def _batch_read(urls: list, cache_dir: str, max_age_days=None, refresh: bool = False) -> list:
+    """batch_read_urls and `web-sieve batch`: fetch each distinct URL once, 8
+    at a time, rebuild the manifests, and return one result per input URL in
+    input order (a repeated URL repeats its result)."""
+    distinct = list(dict.fromkeys(urls))
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        fetched = dict(zip(distinct, pool.map(lambda u: _fetch(u, cache_dir, max_age_days, refresh), distinct)))
+    _rebuild_manifest(cache_dir, list(fetched.values()))
+    return [fetched[u] for u in urls]
 
 
 @mcp.tool()
-def read_url(url: str, cache_dir: str = ".web_cache") -> str:
+def read_url(url: str, cache_dir: str = ".web_cache", max_age_days: float | None = None,
+             refresh: bool = False) -> str:
     """Fetch a URL via Jina Reader, cache the markdown to disk, and return metadata.
 
-    Returns JSON with: path, title, lines, chars, cached (bool).
-    Content is NOT returned — use the path with Read tool or deploy agents against it.
+    Returns JSON with: status (ok, thin, cached, blocked or error), reason, warnings, attempts,
+    path, title, lines, chars, cached, refreshed. Content is NOT returned: use the path with
+    the Read tool, or find_relevant_ranges. A blocked page (a bot challenge or an empty
+    response) is not cached; fetch it with Firecrawl instead (fallback: "firecrawl").
 
     Args:
         url: The URL to fetch.
         cache_dir: Directory to cache markdown files. Use an absolute path to the
                    project's .web_cache/ directory.
+        max_age_days: Fetch again when the cached copy is older than this many days.
+                      Default: a cached page never expires.
+        refresh: Fetch again even when a cached copy exists.
     """
-    result = _fetch_one(url, cache_dir)
-    if "error" not in result:
-        _update_manifest(cache_dir)
-    return json.dumps(result)
+    return json.dumps(_read_url(url, cache_dir, max_age_days, refresh))
 
 
 @mcp.tool()
-def batch_read_urls(urls: list[str], cache_dir: str = ".web_cache") -> str:
+def batch_read_urls(urls: list[str], cache_dir: str = ".web_cache", max_age_days: float | None = None,
+                    refresh: bool = False) -> str:
     """Fetch multiple URLs in parallel via Jina Reader, cache all to disk.
 
-    Returns JSON array of metadata objects (path, title, lines, chars, cached).
-    Content is NOT returned — use the paths with Read tool or deploy agents.
-    Fetches run concurrently (up to 8 threads). Cached pages return instantly.
+    Returns a JSON array with one object per URL, in input order: status (ok, thin, cached,
+    blocked or error), reason, warnings, attempts, path, title, lines, chars, cached,
+    refreshed. Content is NOT returned: use the paths with the Read tool, or
+    find_relevant_ranges. Fetches run concurrently (up to 8 threads); cached pages return
+    at once. A blocked page is not cached; fetch it with Firecrawl instead.
 
     Args:
         urls: List of URLs to fetch.
         cache_dir: Directory to cache markdown files. Use an absolute path to the
                    project's .web_cache/ directory.
+        max_age_days: Fetch again when the cached copy is older than this many days.
+                      Default: a cached page never expires.
+        refresh: Fetch again even when a cached copy exists.
     """
-    results = []
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        futures = {pool.submit(_fetch_one, url, cache_dir): url for url in urls}
-        for future in as_completed(futures):
-            results.append(future.result())
-    # Return in original URL order
-    order = {url: i for i, url in enumerate(urls)}
-    results.sort(key=lambda r: order.get(r.get("url", ""), len(urls)))
-    _update_manifest(cache_dir)
-    return json.dumps(results)
+    return json.dumps(_batch_read(urls, cache_dir, max_age_days, refresh))
 
 
 @mcp.tool()
@@ -229,7 +629,11 @@ def list_cache(cache_dir: str = ".web_cache") -> str:
 
 JEV_MODEL = "jev-1.13.0"          # pinned: the threshold is calibrated against one model version (docs)
 PROMPT_VERSION = 1                # increment on any change to instructions, criteria, state shape or text transform
-DEFAULT_THRESHOLD = 0.5           # provisional, not yet calibrated (spec section 15); p >= threshold selects
+# Calibrated 2026-10-04 on 9 pages x 3 questions (calibration/data): at 0.85 line recall 0.967, precision 0.426,
+# no page misses, no false alarms on absent questions; 0.90 gave 0.923/0.530 but four gold windows scored 0.82
+# to 0.89 and batch-dependent shifts of up to 0.19 were measured, so 0.85 is the safer cut. Haiku baseline for
+# comparison: precision 0.864, recall 0.909, 9.5 s per page vs 0.32 s.
+DEFAULT_THRESHOLD = 0.85          # p >= threshold selects
 WINDOW_TOKENS = 400               # target window size (spec section 4); maximum 2x, minimum 1/5
 WINDOWS_PER_REQUEST = 16          # as jgrep and jevpdf (spec section 5)
 JEV_CONCURRENCY = 4               # requests in flight per call; under the published rate limits (docs, 2026-10-03)
@@ -328,8 +732,11 @@ def _read_cached_page(path: str) -> tuple:
         raise _SourceError("not_a_cached_page", f"not inside a .web_cache directory: {path}")
     # newline="" and a split on \n only number lines as Read, sed and wc do:
     # a lone \r stays inside its line; the \r of a CRLF ending is removed.
-    with open(real, encoding="utf-8", errors="replace", newline="") as f:
-        content = f.read()
+    try:
+        with open(real, encoding="utf-8", errors="replace", newline="") as f:
+            content = f.read()
+    except OSError as e:
+        raise _SourceError("unreadable", f"{path}: {type(e).__name__}: {e.strerror or e}")
     lines = [line[:-1] if line.endswith("\r") else line for line in content.split("\n")]
     if content.endswith("\n"):
         lines.pop()
@@ -432,7 +839,9 @@ def _split_line(line: str, limit: int) -> list:
     cut after the last whitespace in the final 20% of a segment, else at the limit."""
     spans, a, n = [], 0, len(line)
     while a < n:
-        lo, hi = a + 1, n  # largest b with _est_tokens(line[a:b]) <= limit
+        # largest b with _est_tokens(line[a:b]) <= limit; tokens >= chars / CHARS_PER_TOKEN, so b - a is at
+        # most limit * CHARS_PER_TOKEN, and searching only that far keeps a long one-line page linear
+        lo, hi = a + 1, min(n, a + int(limit * CHARS_PER_TOKEN))
         while lo < hi:
             mid = (lo + hi + 1) // 2
             if _est_tokens(line[a:mid]) <= limit:
@@ -751,7 +1160,7 @@ def _new_result(source: str, question, threshold) -> dict:
             "status": "error", "relevant": None, "threshold": threshold, "ranges": [], "range_detail": [],
             "windows": [], "split_lines": {}, "long_lines": {}, "unjudged": [], "file_lines": 0,
             "lines_selected": 0, "model": JEV_MODEL, "requests": 0, "cache_hits": 0, "input_tokens": 0,
-            "cost_usd": 0.0, "elapsed_ms": 0, "jev_events": [], "warnings": []}
+            "cost_usd": 0.0, "elapsed_ms": 0, "refreshed": False, "jev_events": [], "warnings": []}
 
 
 def _set_error(result: dict, kind: str, message: str) -> None:
@@ -802,19 +1211,109 @@ def _fail_all(results: list, cache_dir: str, kind: str, message: str) -> list:
     return results
 
 
-def _fetch_source(url: str, cache_dir: str) -> dict:
-    """_fetch_one, with network exceptions returned as an error entry."""
+def _fetch_source(url: str, cache_dir: str, max_age_days=None, refresh: bool = False) -> dict:
+    """_fetch_one for a URL source, with any exception returned as an error entry.
+    The freshness arguments are passed only when set, so the call stays the
+    two-argument form that the relevance tests' stub of _fetch_one accepts."""
     try:
-        return _fetch_one(url, cache_dir)
-    except (OSError, ValueError, http.client.HTTPException) as e:
+        if max_age_days is None and not refresh:
+            return _fetch_one(url, cache_dir)
+        return _fetch_one(url, cache_dir, max_age_days, refresh)
+    except Exception as e:  # not swallowed: becomes this source's fetch_failed error
         return {"url": url, "error": f"{type(e).__name__}: {e}"}
 
 
+# ── Privacy deny list for Jev sends ───────────────────────────────
+#
+# Pages cached under a denied project never go to Jev. The project names
+# are read from the privacy section of DENY_CONFIG, a file that other Jev
+# hooks on the machine also read, so one list governs every Jev send and no
+# private project name is written in this file. Only the generic
+# DENY_DEFAULTS are built in.
+# Specification: docs/effectiveness-spec.md, section 6.
+
+DENY_DEFAULTS = ("clients", "client_data", "client-data")  # denied with or without the config file
+DENY_CONFIG = os.path.expanduser("~/.claude/jev_hooks/config.json")
+DENY_NOT_CONFIGURED = "deny_list: not configured"  # starts the warning when DENY_CONFIG gives no list
+
+
+def _deny_config() -> tuple:
+    """(names, prefixes, warnings) of the deny list.
+
+    names is DENY_DEFAULTS plus privacy.deny_projects from DENY_CONFIG, and
+    prefixes is privacy.deny_path_prefixes (optional). When the file is
+    missing, does not parse, or has no privacy.deny_projects list, only
+    DENY_DEFAULTS apply and warnings holds one message starting with
+    DENY_NOT_CONFIGURED, which every Jev-sending result then carries.
+    """
+    names = list(DENY_DEFAULTS)
+    try:
+        with open(DENY_CONFIG, encoding="utf-8") as f:
+            config = json.load(f)
+        privacy = config.get("privacy") if isinstance(config, dict) else None
+        extra = privacy.get("deny_projects") if isinstance(privacy, dict) else None
+        more = privacy.get("deny_path_prefixes", []) if isinstance(privacy, dict) else []
+        if not isinstance(extra, list) or not isinstance(more, list):
+            raise ValueError("privacy.deny_projects must be a list, and privacy.deny_path_prefixes a list or absent")
+    except FileNotFoundError:
+        problem = "the file does not exist"
+    except (OSError, ValueError, RecursionError) as e:  # unreadable, not JSON, or not the expected shape
+        problem = f"the file could not be read: {type(e).__name__}: {e}"
+    else:
+        names += [e for e in extra if isinstance(e, str) and e]
+        return names, [p for p in more if isinstance(p, str) and p], []
+    return names, [], [f"{DENY_NOT_CONFIGURED}: {DENY_CONFIG}: {problem}; only the built-in names "
+                       f"{', '.join(DENY_DEFAULTS)} are denied"]
+
+
+def _jev_denied(cache_dir: str, warnings: list | None = None) -> str | None:
+    """The reason pages in cache_dir must not be sent to Jev, or None.
+
+    Denied when a component of the directory's path, as given or with
+    symlinks resolved, equals a deny-list name or starts with <name>-wt- (a
+    git worktree of that project), ignoring case. A name ending in * matches
+    any component that starts with the part before the *, and a resolved
+    path under a privacy.deny_path_prefixes entry is denied. Config
+    warnings are appended to `warnings`.
+    """
+    names, prefixes, problems = _deny_config()
+    if warnings is not None:
+        warnings.extend(w for w in problems if w not in warnings)
+    real = os.path.realpath(cache_dir)
+    parts = sorted({p for p in os.path.abspath(cache_dir).split(os.sep) + real.split(os.sep) if p})
+    for name in names:
+        n = name.lower()
+        for part in parts:
+            low = part.lower()
+            if (n.endswith("*") and low.startswith(n[:-1])) or low == n or low.startswith(n + "-wt-"):
+                return f"{real} is in {part!r}, which is on the Jev deny list as {name!r}; nothing was sent"
+    for prefix in prefixes:
+        base = os.path.realpath(os.path.expanduser(prefix)).rstrip(os.sep)
+        if real == base or real.startswith(base + os.sep):
+            return f"{real} is under the denied path prefix {prefix!r}; nothing was sent"
+    return None
+
+
+def _source_denied(source: str, cache_dir: str, warnings: list) -> str | None:
+    """_jev_denied for one source of _relevance: cache_dir for a URL, else the
+    page's directory, both as given and through any symlink to the file."""
+    if source.startswith(_URL_PREFIXES):
+        return _jev_denied(cache_dir, warnings)
+    for directory in (os.path.dirname(os.path.abspath(source)), os.path.dirname(os.path.realpath(source))):
+        reason = _jev_denied(directory, warnings)
+        if reason:
+            return reason
+    return None
+
+
 def _relevance(question, sources, cache_dir=".web_cache", threshold=None, window_tokens=WINDOW_TOKENS,
-               max_windows=MAX_WINDOWS, *, batch_size=WINDOWS_PER_REQUEST, strip_links=STRIP_LINKS) -> list:
+               max_windows=MAX_WINDOWS, *, batch_size=WINDOWS_PER_REQUEST, strip_links=STRIP_LINKS,
+               max_age_days=None, refresh=False) -> list:
     """Judge every window of every source with Jev; one result per source, in
     input order (spec section 3.4). Used by find_relevant_ranges, the CLI and
-    calibration/calibrate.py; batch_size and strip_links are for calibration."""
+    calibration/calibrate.py; batch_size and strip_links are for calibration.
+    A source on the Jev deny list gets status "denied" and sends nothing;
+    max_age_days and refresh apply to URL sources (effectiveness spec 3 and 6)."""
     started = time.monotonic()
     question = question.strip() if isinstance(question, str) else question
     used = DEFAULT_THRESHOLD if threshold is None else threshold
@@ -826,33 +1325,53 @@ def _relevance(question, sources, cache_dir=".web_cache", threshold=None, window
             r["elapsed_ms"] = elapsed
         return results
 
-    problem = _usage_problem(question, threshold, window_tokens, max_windows, batch_size)
+    problem = (_usage_problem(question, threshold, window_tokens, max_windows, batch_size)
+               or _freshness_problem(max_age_days, refresh))
     if problem:
         _fail_all(results, cache_dir, "usage", problem)
+        return finish()
+    deny_warnings, active = [], []
+    for i, source in enumerate(sources):
+        reason = _source_denied(source, cache_dir, deny_warnings)
+        if reason:
+            _fail_all([results[i]], cache_dir, "denied", reason)
+            results[i].update(status="denied", reason=reason)
+        else:
+            active.append(i)
+    for r in results:
+        r["warnings"].extend(deny_warnings)
+    if not active:
         return finish()
     try:
         jev = _load_jev()
     except _SourceError as e:
-        _fail_all(results, cache_dir, e.kind, e.message)
+        _fail_all([results[i] for i in active], cache_dir, e.kind, e.message)
         return finish()
     key = jev.resolve_key()[0]  # never logged, returned or stored
     if not key:
-        _fail_all(results, cache_dir, "no_key", "no JEV_API_KEY in the environment or the keychain")
+        _fail_all([results[i] for i in active], cache_dir, "no_key",
+                  "no JEV_API_KEY in the environment or the keychain")
         return finish()
 
     # URL sources resolve through the fetch cache; a fetch error fails only that source.
-    url_index = [i for i, s in enumerate(sources) if s.startswith(_URL_PREFIXES)]
-    paths = [None if s.startswith(_URL_PREFIXES) else os.path.abspath(s) for s in sources]
+    url_index = [i for i in active if sources[i].startswith(_URL_PREFIXES)]
+    paths = [os.path.abspath(sources[i]) if i in active and not sources[i].startswith(_URL_PREFIXES) else None
+             for i in range(len(sources))]
     fetched = False
     if url_index:
         with ThreadPoolExecutor(max_workers=8) as pool:
-            metas = list(pool.map(lambda i: _fetch_source(sources[i], cache_dir), url_index))
+            metas = list(pool.map(lambda i: _fetch_source(sources[i], cache_dir, max_age_days, refresh), url_index))
         for i, meta in zip(url_index, metas):
+            results[i]["warnings"].extend(meta.get("warnings") or [])
             if "error" in meta:
                 detail = str(meta.get("detail", ""))[:200]
                 _set_error(results[i], "fetch_failed", f"{meta['error']}{': ' + detail if detail else ''}")
+            elif meta.get("status") == "blocked":
+                _set_error(results[i], "blocked", f"{meta.get('reason', '')}; fetch it with Firecrawl instead")
+                fetched = True  # a sidecar may have been written
             else:
                 paths[i] = meta["path"]
+                results[i]["refreshed"] = bool(meta.get("refreshed"))
                 fetched = fetched or not meta.get("cached", True)
 
     pages, caches, jobs = {}, {}, []
@@ -966,7 +1485,7 @@ def _relevance(question, sources, cache_dir=".web_cache", threshold=None, window
                 r["warnings"].append(message)
 
     if fetched:
-        _update_manifest(cache_dir)
+        _rebuild_manifest(cache_dir, results)
     return finish()
 
 
@@ -979,7 +1498,8 @@ def _exit_code(results: list) -> int:
 @mcp.tool()
 def find_relevant_ranges(question: str, sources: list[str], cache_dir: str = ".web_cache",
                          threshold: float | None = None, window_tokens: int = WINDOW_TOKENS,
-                         max_windows: int = MAX_WINDOWS) -> str:
+                         max_windows: int = MAX_WINDOWS, max_age_days: float | None = None,
+                         refresh: bool = False) -> str:
     """Find the line ranges of cached web pages that help answer a question. Jev judges each window of each page and returns, per page, `status`, `relevant`, `ranges` (inclusive file line numbers for Read offset/limit) and every window's probability. One call handles several pages.
 
     Args:
@@ -989,14 +1509,527 @@ def find_relevant_ranges(question: str, sources: list[str], cache_dir: str = ".w
         threshold: minimum probability for a window to count as relevant (default: the calibrated value).
         window_tokens: target window size.
         max_windows: refuse pages with more windows than this.
+        max_age_days: for URL sources, fetch again when the cached copy is older than this many days.
+        refresh: for URL sources, fetch again even when a cached copy exists.
 
-    If `status` is not `ok`, the page was not fully judged: `relevant` is `null` unless a judged window passed, and `unjudged` lists the line ranges Jev did not judge. Do not treat such a page as irrelevant.
+    If `status` is not `ok`, the page was not fully judged: `relevant` is `null` unless a judged window passed, and `unjudged` lists the line ranges Jev did not judge. Do not treat such a page as irrelevant. `status: denied` means the page's project is on the Jev deny list and nothing was sent.
     """
-    return json.dumps(_relevance(question, sources, cache_dir, threshold, window_tokens, max_windows))
+    return json.dumps(_relevance(question, sources, cache_dir, threshold, window_tokens, max_windows,
+                                 max_age_days=max_age_days, refresh=refresh))
+
+
+# ── search_cache: BM25 over cached pages, optional Jev rerank ─────
+#
+# Finds already-cached material without fetching. Windows are the ones
+# find_relevant_ranges uses; per-page term counts are kept in
+# search_index.sqlite so a repeat query on an unchanged cache only reads.
+# Specification: docs/effectiveness-spec.md, section 5.
+
+SEARCH_INDEX_DB = "search_index.sqlite"  # in the .web_cache/ directory it indexes
+SEARCH_INDEX_VERSION = 1                 # increment when tokenising or the stored shape changes
+BM25_K1 = 1.2                            # spec section 5
+BM25_B = 0.75                            # spec section 5
+TITLE_WEIGHT = 2                         # title tokens are counted this many times in every window of the page
+SEARCH_WINDOWS_PER_PAGE = 3              # best windows reported per page
+SEARCH_JEV_WINDOWS = 20                  # windows reranked by Jev with jev=True
+_TOKEN_RE = re.compile(r"\w+")
+
+
+def _terms(text: str) -> list:
+    """Lower-cased \\w+ tokens."""
+    return _TOKEN_RE.findall(text.lower())
+
+
+class _SearchIndex:
+    """Window term counts per page, in sqlite.
+
+    A page's row is reused while its mtime and size are unchanged, or when
+    its sha256 is unchanged; otherwise its windows are built again. Rows of
+    pages that are gone are removed. A sqlite error never stops a search:
+    the index is then built in memory for the call and the error is kept in
+    `errors` for the warnings.
+    """
+
+    def __init__(self, directory: str):
+        self.path = os.path.join(directory, SEARCH_INDEX_DB)
+        self.errors = []
+        self.version = f"{SEARCH_INDEX_VERSION}:{WINDOW_TOKENS}:{STRIP_LINKS}:{TITLE_WEIGHT}"
+        try:
+            self.conn = sqlite3.connect(self.path, timeout=5)
+            self._schema()
+        except sqlite3.Error as e:
+            self.errors.append(f"search index {self.path} unusable, built in memory for this call: {e}")
+            self.conn = sqlite3.connect(":memory:")
+            self._schema()
+
+    def _schema(self) -> None:
+        c = self.conn
+        c.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        row = c.execute("SELECT value FROM meta WHERE key = 'version'").fetchone()
+        if row is None or row[0] != self.version:
+            c.execute("DROP TABLE IF EXISTS pages")
+            c.execute("DROP TABLE IF EXISTS postings")
+            c.execute("INSERT OR REPLACE INTO meta VALUES ('version', ?)", (self.version,))
+        # windows: JSON [[window id, start, end, length], ...]; hits: JSON [[window index, count], ...]
+        c.execute("CREATE TABLE IF NOT EXISTS pages (id INTEGER PRIMARY KEY, file TEXT UNIQUE NOT NULL, "
+                  "mtime_ns INTEGER NOT NULL, size INTEGER NOT NULL, sha TEXT NOT NULL, url TEXT NOT NULL, "
+                  "title TEXT NOT NULL, windows TEXT NOT NULL)")
+        c.execute("CREATE TABLE IF NOT EXISTS postings (term TEXT NOT NULL, page INTEGER NOT NULL, "
+                  "hits TEXT NOT NULL, PRIMARY KEY (term, page)) WITHOUT ROWID")
+        c.execute("CREATE INDEX IF NOT EXISTS postings_page ON postings (page)")
+        c.commit()
+
+    def refresh(self, cache_dir: str, files: list, stats: dict, warnings: list) -> None:
+        """Bring the rows in line with `files`, counting reused, rebuilt and removed pages in stats."""
+        c = self.conn
+        known = {f: (pid, mt, size, sha) for pid, f, mt, size, sha in
+                 c.execute("SELECT id, file, mtime_ns, size, sha FROM pages")}
+        for gone in set(known) - set(files):
+            c.execute("DELETE FROM postings WHERE page = ?", (known[gone][0],))
+            c.execute("DELETE FROM pages WHERE id = ?", (known[gone][0],))
+            stats["removed"] += 1
+        for fname in files:
+            path = os.path.join(cache_dir, fname)
+            try:
+                st = os.stat(path)
+            except OSError as e:
+                warnings.append(f"skipped {fname}: {type(e).__name__}: {e}")
+                continue
+            row = known.get(fname)
+            if row and row[1] == st.st_mtime_ns and row[2] == st.st_size:
+                stats["reused"] += 1
+                continue
+            try:
+                with open(path, "rb") as f:
+                    sha = hashlib.sha256(f.read()).hexdigest()
+            except OSError as e:
+                warnings.append(f"skipped {fname}: {type(e).__name__}: {e}")
+                continue
+            if row and row[3] == sha:
+                c.execute("UPDATE pages SET mtime_ns = ?, size = ? WHERE id = ?", (st.st_mtime_ns, st.st_size, row[0]))
+                stats["reused"] += 1
+                continue
+            if row:
+                c.execute("DELETE FROM postings WHERE page = ?", (row[0],))
+                c.execute("DELETE FROM pages WHERE id = ?", (row[0],))
+            try:
+                lines, body_start, meta = _read_cached_page(path)
+            except _SourceError as e:
+                warnings.append(f"skipped {fname}: {e.kind}: {e.message}")
+                continue
+            title_terms = _terms(meta["title"]) * TITLE_WEIGHT
+            windows, postings = [], {}
+            for k, w in enumerate(_windows(lines, body_start, WINDOW_TOKENS)):
+                counts = {}
+                for term in _terms(w["text"]) + title_terms:
+                    counts[term] = counts.get(term, 0) + 1
+                start, end = w["start"], w["end"]
+                while start < end and not lines[start - 1].strip():
+                    start += 1
+                while end > start and not lines[end - 1].strip():
+                    end -= 1
+                windows.append([w["id"], start, end, sum(counts.values())])
+                for term, n in counts.items():
+                    postings.setdefault(term, []).append([k, n])
+            cur = c.execute("INSERT INTO pages (file, mtime_ns, size, sha, url, title, windows) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                            (fname, st.st_mtime_ns, st.st_size, sha, meta["url"], meta["title"], json.dumps(windows)))
+            c.executemany("INSERT INTO postings VALUES (?, ?, ?)",
+                          [(term, cur.lastrowid, json.dumps(hits)) for term, hits in postings.items()])
+            stats["rebuilt"] += 1
+        c.commit()
+
+    def pages(self) -> list:
+        """(id, file, url, title, windows) for every indexed page, in file order."""
+        return [(pid, f, url, title, json.loads(wins)) for pid, f, url, title, wins in
+                self.conn.execute("SELECT id, file, url, title, windows FROM pages ORDER BY file")]
+
+    def postings(self, terms: list) -> list:
+        """(term, page id, [[window index, count], ...]) for the given terms."""
+        marks = ",".join("?" * len(terms))
+        return [(t, pid, json.loads(hits)) for t, pid, hits in
+                self.conn.execute(f"SELECT term, page, hits FROM postings WHERE term IN ({marks})", terms)]
+
+    def close(self) -> None:
+        self.conn.close()
+
+
+def _search_files(cache_dir: str, warnings: list) -> list:
+    """Page files to search: the non-blocked rows of manifest.json. When
+    manifest.json is missing, unreadable or does not list exactly the pages
+    on disk, the rows are built from the directory instead, with a warning."""
+    on_disk = sorted(f for f in os.listdir(cache_dir) if f.endswith(".md") and f != "manifest.md"
+                     and os.path.isfile(os.path.join(cache_dir, f)))
+    try:
+        with open(os.path.join(cache_dir, "manifest.json"), encoding="utf-8") as f:
+            rows = json.load(f)
+        listed = sorted(r["file"] for r in rows if r.get("status") != "blocked")
+    except (OSError, ValueError, TypeError, KeyError, AttributeError) as e:
+        warnings.append(f"manifest.json not usable ({type(e).__name__}); pages listed from the directory")
+        return on_disk
+    if listed != on_disk:
+        warnings.append("manifest.json does not match the pages on disk; pages listed from the directory "
+                        "(a fetch or audit rebuilds it)")
+        return on_disk
+    return listed
+
+
+def _search(query, cache_dir=".web_cache", top_k=10, jev=False) -> dict:
+    """Rank cached pages for a query with BM25 over their windows, and with
+    jev=True rerank the top SEARCH_JEV_WINDOWS windows with Jev (spec
+    section 5). Used by search_cache and `web-sieve search`. The output
+    holds file names, line numbers and scores, never page text.
+    """
+    started = time.monotonic()
+    out = {"query": query, "cache_dir": os.path.abspath(cache_dir) if isinstance(cache_dir, str) else cache_dir,
+           "status": "ok", "jev": jev, "pages": [],
+           "index": {"pages": 0, "windows": 0, "rebuilt": 0, "reused": 0, "removed": 0},
+           "jev_requests": 0, "cache_hits": 0, "input_tokens": 0, "cost_usd": 0.0, "elapsed_ms": 0,
+           "jev_events": [], "warnings": []}
+
+    def finish() -> dict:
+        out["elapsed_ms"] = int((time.monotonic() - started) * 1000)
+        return out
+
+    query = query.strip() if isinstance(query, str) else query
+    out["query"] = query
+    if not isinstance(query, str) or not _terms(query):
+        problem = "query has no words"
+    elif len(query) > MAX_QUESTION_CHARS:
+        problem = f"query is {len(query)} characters; the limit is {MAX_QUESTION_CHARS}"
+    elif isinstance(top_k, bool) or not isinstance(top_k, int) or top_k < 1:
+        problem = f"top_k must be an integer of at least 1, not {top_k!r}"
+    elif not isinstance(jev, bool):
+        problem = f"jev must be true or false, not {jev!r}"
+    else:
+        problem = ""
+    if problem:
+        out.update(status="error", error={"kind": "usage", "message": problem})
+        return finish()
+    if not os.path.isdir(cache_dir):
+        out.update(status="error", error={"kind": "not_found", "message": f"no such directory: {cache_dir}"})
+        return finish()
+
+    try:
+        files = _search_files(cache_dir, out["warnings"])
+    except OSError as e:
+        out.update(status="error", error={"kind": "unreadable", "message": f"{cache_dir}: {type(e).__name__}: {e}"})
+        return finish()
+    index = _SearchIndex(cache_dir)
+    try:
+        index.refresh(cache_dir, files, out["index"], out["warnings"])
+        pages = index.pages()
+        terms = sorted(set(_terms(query)))
+        postings = index.postings(terms)
+    except (sqlite3.Error, ValueError, TypeError) as e:
+        out.update(status="error", error={"kind": "index_error", "message": f"search index {index.path}: "
+                                          f"{type(e).__name__}: {e}; delete the file to rebuild it"})
+        return finish()
+    finally:
+        out["warnings"].extend(index.errors)
+        index.close()
+
+    # BM25 over every window of every page (spec: k1=1.2, b=0.75, title tokens counted twice).
+    lengths = [w[3] for _, _, _, _, wins in pages for w in wins]
+    total = len(lengths)
+    out["index"].update(pages=len(pages), windows=total)
+    if not total:
+        return finish()
+    avg = sum(lengths) / total
+    by_id = {pid: (fname, url, title, wins) for pid, fname, url, title, wins in pages}
+    df = {}
+    for term, _, hits in postings:
+        df[term] = df.get(term, 0) + len(hits)
+    scores = {}  # (page id, window index) -> score
+    for term, pid, hits in postings:
+        idf = math.log(1 + (total - df[term] + 0.5) / (df[term] + 0.5))
+        wins = by_id[pid][3]
+        for k, tf in hits:
+            norm = tf + BM25_K1 * (1 - BM25_B + BM25_B * wins[k][3] / avg)
+            scores[(pid, k)] = scores.get((pid, k), 0.0) + idf * tf * (BM25_K1 + 1) / norm
+    per_page = {}
+    for (pid, k), score in scores.items():
+        per_page.setdefault(pid, []).append((score, k))
+    ranked = sorted(per_page, key=lambda pid: (-max(per_page[pid])[0], by_id[pid][0]))[:top_k]
+
+    found = []
+    for pid in ranked:
+        fname, url, title, wins = by_id[pid]
+        hits = sorted(per_page[pid], key=lambda sk: (-sk[0], wins[sk[1]][1]))
+        found.append({"pid": pid, "file": fname, "path": os.path.abspath(os.path.join(cache_dir, fname)),
+                      "url": url, "title": title, "score": round(hits[0][0], 4),
+                      "hits": [(wins[k][0], wins[k][1], wins[k][2], score) for score, k in hits]})
+
+    if jev:
+        _search_rerank(query, cache_dir, found, out)
+
+    for page in found:
+        chosen, seen = [], set()
+        for wid, start, end, score, *p in page["hits"]:
+            if (start, end) in seen:
+                continue  # segments of one split line: the line is reported once, with its best segment
+            seen.add((start, end))
+            chosen.append([start, end, round(score, 4)] + ([p[0]] if jev else []))
+            if len(chosen) == SEARCH_WINDOWS_PER_PAGE:
+                break
+        entry = {"file": page["file"], "url": page["url"], "title": page["title"], "score": page["score"],
+                 "windows": chosen}
+        if jev:
+            entry["p"] = page.get("p")
+        out["pages"].append(entry)
+    return finish()
+
+
+def _search_rerank(query: str, cache_dir: str, found: list, out: dict) -> None:
+    """Ask Jev about the top SEARCH_JEV_WINDOWS windows of the found pages and
+    reorder pages and windows by p (then BM25). Uses the find_relevant_ranges
+    machinery: the same state and Noul, the answers cache, the pinned model,
+    the deny list and the fail-fast rule. Every hit gains p (None when not
+    judged); out gains status, error, requests, tokens, cost and events."""
+    for page in found:
+        page["hits"] = [h + (None,) for h in page["hits"]]
+    candidates = sorted(((h[3], page["file"], h[1], n, h[0]) for n, page in enumerate(found) for h in page["hits"]),
+                        key=lambda c: (-c[0], c[1], c[2]))[:SEARCH_JEV_WINDOWS]
+    # The cache, and each page that would be sent as it is and through a link (as find_relevant_ranges does).
+    reason = _jev_denied(cache_dir, out["warnings"])
+    for n in sorted({c[3] for c in candidates}):
+        reason = reason or _source_denied(found[n]["path"], cache_dir, out["warnings"])
+    if reason:
+        out.update(status="denied", reason=reason)
+        return
+    if not candidates:
+        return
+    try:
+        jev = _load_jev()
+    except _SourceError as e:
+        out.update(status="error", error={"kind": e.kind, "message": e.message})
+        return
+    key = jev.resolve_key()[0]  # never logged, returned or stored
+    if not key:
+        out.update(status="error",
+                   error={"kind": "no_key", "message": "no JEV_API_KEY in the environment or the keychain"})
+        return
+
+    wanted = {}
+    for _, _, _, n, wid in candidates:
+        wanted.setdefault(n, set()).add(wid)
+    cache = _AnswerCache(os.path.realpath(cache_dir))
+    probs, failures, jobs, served = {}, [], [], set()
+    try:
+        for n, ids in sorted(wanted.items()):
+            try:
+                lines, body_start, meta = _read_cached_page(found[n]["path"])
+            except _SourceError as e:
+                failures.append((e.kind, e.message))
+                continue
+            chosen = [w for w in _windows(lines, body_start, WINDOW_TOKENS) if w["id"] in ids]
+            for number, batch in enumerate(_batches(chosen, query, meta, WINDOWS_PER_REQUEST), 1):
+                if batch["over_budget"]:
+                    failures.append(("over_budget", f"{found[n]['file']} window {', '.join(batch['ids'])} is over "
+                                                    "the token budget on its own; not sent"))
+                    continue
+                hit = cache.get(batch["keys"])
+                if hit is None:
+                    jobs.append(dict(batch, page=n, source_text=found[n]["file"], batch=number, cache=cache))
+                    continue
+                out["cache_hits"] += 1
+                for wid, k in zip(batch["ids"], batch["keys"]):
+                    probs[(n, wid)] = hit[k][0]
+                    served.add(hit[k][1])
+        outcomes = _ask_batches(jobs, jev, key) if jobs else []
+    finally:
+        cache.close()
+
+    first = next((o for o in outcomes if "kind" in o and o["sent"]), None)
+    for job, outcome in zip(jobs, outcomes):
+        out["jev_events"].extend(outcome["events"])
+        out["jev_requests"] += 1 if outcome["sent"] else 0
+        if "probs" in outcome:
+            tokens = (outcome["body"].get("usage") or {}).get("input_tokens")
+            if isinstance(tokens, int) and not isinstance(tokens, bool) and 0 <= tokens < 2 ** 53:
+                out["input_tokens"] += tokens
+            else:
+                out["warnings"].append(f"{job['source_text']} batch {job['batch']} response has no valid "
+                                       "usage.input_tokens; cost is undercounted")
+            served.add(str(outcome["body"].get("model")))
+            for wid, p in outcome["probs"].items():
+                probs[(job["page"], wid)] = p
+        else:
+            failures.append((outcome["kind"], outcome["message"] or (
+                f"not sent after an earlier request in this call failed ({first['kind']}: {first['message'][:200]})")))
+    out["cost_usd"] = round(out["input_tokens"] * PRICE_PER_MTOK_USD / 1_000_000, 6)
+    for name in sorted(served - {JEV_MODEL}):
+        out["warnings"].append(f"Jev served model {name}, not the pinned {JEV_MODEL}; answers kept")
+    out["warnings"].extend(m for m in cache.errors if m not in out["warnings"])
+
+    judged = sum(1 for c in candidates if (c[3], c[4]) in probs)
+    if judged < len(candidates):
+        kind, message = next((f for f in failures if f[0] not in ("not_sent_after_failure", "over_budget")),
+                             next((f for f in failures if f[0] != "not_sent_after_failure"),
+                                  failures[0] if failures else ("not_judged", "some windows were not judged")))
+        out.update(status="partial" if judged else "error", error={"kind": kind, "message": message})
+    for n, page in enumerate(found):
+        page["hits"] = [(wid, start, end, score, probs.get((n, wid))) for wid, start, end, score, _ in page["hits"]]
+        page["hits"].sort(key=lambda h: (h[4] is None, -(h[4] or 0.0), -h[3], h[1]))
+        judged_p = [h[4] for h in page["hits"] if h[4] is not None]
+        page["p"] = max(judged_p) if judged_p else None
+    found.sort(key=lambda page: (page["p"] is None, -(page["p"] or 0.0), -page["score"], page["file"]))
+
+
+def _search_exit(out: dict) -> int:
+    """CLI exit code of `web-sieve search`: 0 when status is ok; for an error
+    or partial result the code of its kind as in `ranges`; 1 when denied."""
+    if out["status"] == "ok":
+        return 0
+    return _EXIT_BY_KIND.get((out.get("error") or {}).get("kind"), 1)
+
+
+@mcp.tool()
+def search_cache(query: str, cache_dir: str = ".web_cache", top_k: int = 10, jev: bool = False) -> str:
+    """Search the pages already cached in a project's .web_cache/ for a query, without fetching anything. Check this before fetching: a page found here needs no new request.
+
+    Ranks pages with BM25 over the same windows find_relevant_ranges uses (title words count twice) and returns, per page, file, url, title, score and its best three windows as [start, end, score] file line numbers for Read offset/limit. No page text is returned.
+
+    Args:
+        query: the words or question to look for.
+        cache_dir: absolute path of the project's `.web_cache/`.
+        top_k: number of pages to return.
+        jev: also ask Jev about the top 20 windows and order by its probability; each window becomes [start, end, score, p]. Sends those windows to TypeSafe, so the deny list applies: a denied project returns `status: denied` with the lexical results only. A `status` other than `ok` or `denied` means Jev did not judge every window; read `error`.
+    """
+    return json.dumps(_search(query, cache_dir, top_k, jev))
+
+
+# ── audit: classify and quarantine existing pages ─────────────────
+#
+# Specification: docs/effectiveness-spec.md, section 7.
+
+QUARANTINE_DIR = "_quarantine"
+
+
+def _free_name(directory: str, fname: str) -> str:
+    """A path in directory for fname that does not exist yet: fname, else fname with -2, -3, ... before .md."""
+    stem, ext = os.path.splitext(fname)
+    path, n = os.path.join(directory, fname), 1
+    while os.path.exists(path):
+        n += 1
+        path = os.path.join(directory, f"{stem}-{n}{ext}")
+    return path
+
+
+def _mark_thin(path: str, content: str) -> None:
+    """Rewrite a page with status: thin in its frontmatter, replacing a status: line or adding one
+    before the closing ---. Everything else in the file is kept byte for byte."""
+    lines = content.split("\n")
+    end = next(k for k in range(1, len(lines)) if lines[k].rstrip("\r") == "---")
+    cr = "\r" if lines[end].endswith("\r") else ""
+    at = next((k for k in range(1, end) if lines[k].startswith("status:")), None)
+    if at is None:
+        lines.insert(end, "status: thin" + cr)
+    else:
+        lines[at] = "status: thin" + cr
+    _write_atomic(path, "\n".join(lines), os.stat(path).st_mode & 0o777)
+
+
+def _audit(cache_dir, apply=False) -> dict:
+    """Classify every cached page in cache_dir with _classify_body and, with
+    apply, act on the result (spec section 7). Used by audit_cache and
+    `web-sieve audit`.
+
+    Report: counts per status, the challenge and empty pages, and with apply
+    the moves, the thin pages marked and the sidecars written. apply moves
+    challenge and empty pages into _quarantine/ (never deletes), logs each
+    move to _quarantine/quarantine.jsonl, writes a blocked sidecar whose at
+    is the page's fetched time (so a fetch more than 24 hours after the stub
+    was fetched goes to the network again), adds status: thin to thin pages,
+    and rebuilds both manifests. ok pages are not written. A second run
+    moves nothing.
+    """
+    out = {"cache_dir": os.path.abspath(cache_dir) if isinstance(cache_dir, str) else cache_dir,
+           "apply": apply, "status": "ok", "pages": 0, "counts": {"ok": 0, "thin": 0, "challenge": 0, "empty": 0},
+           "challenge": [], "empty": [], "moved": [], "marked_thin": [], "sidecars_written": 0,
+           "skipped": [], "errors": [], "warnings": []}
+    if not isinstance(apply, bool):
+        out.update(status="error", error={"kind": "usage", "message": f"apply must be true or false, not {apply!r}"})
+        return out
+    if not isinstance(cache_dir, str) or not os.path.isdir(cache_dir):
+        out.update(status="error", error={"kind": "not_found", "message": f"no such directory: {cache_dir}"})
+        return out
+    quarantine = os.path.join(cache_dir, QUARANTINE_DIR)
+    try:
+        names = sorted(os.listdir(cache_dir))
+    except OSError as e:
+        out.update(status="error", error={"kind": "unreadable", "message": f"{cache_dir}: {type(e).__name__}: {e}"})
+        return out
+    for fname in names:
+        path = os.path.join(cache_dir, fname)
+        if not fname.endswith(".md") or fname == "manifest.md" or not os.path.isfile(path):
+            continue
+        try:
+            content = _read_text(path)
+        except OSError as e:
+            out["errors"].append(f"{fname}: {type(e).__name__}: {e}")
+            continue
+        fields, text = _frontmatter(content)
+        url = fields.get("url", "")
+        if not url:
+            out["skipped"].append({"file": fname, "reason": "no web-sieve frontmatter with a url: line"})
+            continue
+        status, reason = _classify_body(url, text)
+        out["pages"] += 1
+        out["counts"][status] += 1
+        if status in _BLOCKING:
+            out[status].append({"file": fname, "url": url, "title": fields.get("title", ""), "reason": reason})
+        if not apply:
+            continue
+        try:
+            if status in _BLOCKING:
+                os.makedirs(quarantine, exist_ok=True)
+                target = _free_name(quarantine, fname)
+                os.replace(path, target)
+                moved_to = os.path.join(QUARANTINE_DIR, os.path.basename(target))
+                with open(os.path.join(quarantine, "quarantine.jsonl"), "a", encoding="utf-8") as log:
+                    log.write(json.dumps({"file": fname, "url": url, "status": status, "reason": reason,
+                                          "moved_to": moved_to, "at": _iso(_now())}) + "\n")
+                out["moved"].append({"file": fname, "status": status, "moved_to": moved_to})
+                fetched_at = _epoch(fields.get("fetched", ""))
+                at = _iso(fetched_at if fetched_at is not None else _now())
+                sidecar = os.path.join(cache_dir, f"{_url_hash(url)}.blocked.json")
+                existing = _read_sidecar(sidecar)
+                existing_at = _epoch(existing.get("at", "")) if existing else None
+                if existing_at is None or existing_at < _epoch(at):
+                    _write_atomic(sidecar, json.dumps({"url": url, "status": "blocked", "reason": reason, "attempts": 1,
+                                                       "at": at, "quarantined": moved_to}, indent=1) + "\n")
+                    out["sidecars_written"] += 1
+            elif status == "thin" and fields.get("status") != "thin":
+                _mark_thin(path, content)
+                out["marked_thin"].append(fname)
+        except OSError as e:
+            out["errors"].append(f"{fname}: {type(e).__name__}: {e}")
+    if apply:
+        try:
+            _update_manifest(cache_dir)
+        except OSError as e:
+            out["errors"].append(f"manifest not rebuilt: {type(e).__name__}: {e}")
+    if out["errors"]:
+        out["status"] = "partial"
+    return out
+
+
+@mcp.tool()
+def audit_cache(cache_dir: str = ".web_cache", apply: bool = False) -> str:
+    """Check every page cached in a project's .web_cache/ for bot-challenge pages, empty pages and thin pages.
+
+    Returns counts per status (ok, thin, challenge, empty) and lists the challenge and empty pages. With apply=true it moves challenge and empty pages to `_quarantine/` (never deletes them), logs each move in `_quarantine/quarantine.jsonl`, writes a blocked sidecar for each URL, marks thin pages `status: thin`, and rebuilds manifest.md and manifest.json. Running it twice moves nothing the second time.
+
+    Args:
+        cache_dir: absolute path of the project's `.web_cache/`.
+        apply: false (default) only reports; true makes the changes.
+    """
+    return json.dumps(_audit(cache_dir, apply))
 
 
 def _cli():
-    """CLI entrypoint: web-sieve read|batch|list|ranges — same caching as the MCP server."""
+    """CLI entrypoint: web-sieve read|batch|list|ranges|search|audit — same caching as the MCP server."""
     import argparse
 
     parser = argparse.ArgumentParser(
@@ -1005,17 +2038,24 @@ def _cli():
     )
     sub = parser.add_subparsers(dest="command")
 
-    # read <url> [--cache-dir]
+    def freshness(p):
+        p.add_argument("--max-age-days", type=float, default=None,
+                       help="Fetch again when the cached copy is older than this many days (default: never)")
+        p.add_argument("--refresh", action="store_true", help="Fetch again even when a cached copy exists")
+
+    # read <url> [--cache-dir] [--print] [--max-age-days] [--refresh]
     p_read = sub.add_parser("read", help="Fetch a single URL, cache to disk, print metadata JSON")
     p_read.add_argument("url", help="URL to fetch")
     p_read.add_argument("--cache-dir", default=".web_cache", help="Cache directory (default: .web_cache)")
     p_read.add_argument("--print", "-p", action="store_true", dest="print_content",
                         help="Print the cached markdown content instead of metadata")
+    freshness(p_read)
 
-    # batch <url> [<url> ...] [--cache-dir]
+    # batch <url> [<url> ...] [--cache-dir] [--max-age-days] [--refresh]
     p_batch = sub.add_parser("batch", help="Fetch multiple URLs in parallel, cache to disk")
     p_batch.add_argument("urls", nargs="+", help="URLs to fetch")
     p_batch.add_argument("--cache-dir", default=".web_cache", help="Cache directory (default: .web_cache)")
+    freshness(p_batch)
 
     # list [--cache-dir]
     p_list = sub.add_parser("list", help="List all cached pages with metadata")
@@ -1032,13 +2072,27 @@ def _cli():
                           help=f"Target window size in tokens (default: {WINDOW_TOKENS})")
     p_ranges.add_argument("--max-windows", type=int, default=MAX_WINDOWS,
                           help=f"Refuse pages with more windows than this (default: {MAX_WINDOWS})")
+    freshness(p_ranges)
+
+    # search "QUERY" [--cache-dir] [--top-k] [--jev]
+    p_search = sub.add_parser("search", help="Search cached pages with BM25 (no network); --jev reranks with Jev")
+    p_search.add_argument("query", help="Words or a question to look for")
+    p_search.add_argument("--cache-dir", default=".web_cache", help="Cache directory (default: .web_cache)")
+    p_search.add_argument("--top-k", type=int, default=10, help="Pages to return (default: 10)")
+    p_search.add_argument("--jev", action="store_true",
+                          help="Rerank the top 20 windows with Jev (sends them to TypeSafe)")
+
+    # audit <cache_dir> [--apply | --dry-run]
+    p_audit = sub.add_parser("audit", help="Classify every cached page; --apply quarantines challenge and empty pages")
+    p_audit.add_argument("cache_dir", help="Cache directory to audit")
+    mode = p_audit.add_mutually_exclusive_group()
+    mode.add_argument("--apply", action="store_true", help="Move, mark and rebuild (default: report only)")
+    mode.add_argument("--dry-run", action="store_true", help="Report only; this is the default")
 
     args = parser.parse_args()
 
     if args.command == "read":
-        result = _fetch_one(args.url, args.cache_dir)
-        if "error" not in result:
-            _update_manifest(args.cache_dir)
+        result = _read_url(args.url, args.cache_dir, args.max_age_days, args.refresh)
         if args.print_content and "path" in result:
             with open(result["path"]) as f:
                 content = f.read()
@@ -1049,24 +2103,27 @@ def _cli():
             print(json.dumps(result, indent=2))
 
     elif args.command == "batch":
-        results = []
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            futures = {pool.submit(_fetch_one, url, args.cache_dir): url for url in args.urls}
-            for future in as_completed(futures):
-                results.append(future.result())
-        order = {url: i for i, url in enumerate(args.urls)}
-        results.sort(key=lambda r: order.get(r.get("url", ""), len(args.urls)))
-        _update_manifest(args.cache_dir)
-        print(json.dumps(results, indent=2))
+        print(json.dumps(_batch_read(args.urls, args.cache_dir, args.max_age_days, args.refresh), indent=2))
 
     elif args.command == "list":
         print(list_cache(args.cache_dir))
 
     elif args.command == "ranges":
         results = _relevance(args.question, args.sources, args.cache_dir, args.threshold,
-                             args.window_tokens, args.max_windows)
+                             args.window_tokens, args.max_windows, max_age_days=args.max_age_days,
+                             refresh=args.refresh)
         print(json.dumps(results, indent=2))
         sys.exit(_exit_code(results))
+
+    elif args.command == "search":
+        out = _search(args.query, args.cache_dir, args.top_k, args.jev)
+        print(json.dumps(out, indent=2))
+        sys.exit(_search_exit(out))
+
+    elif args.command == "audit":
+        out = _audit(args.cache_dir, args.apply)
+        print(json.dumps(out, indent=2))
+        sys.exit(0 if out["status"] == "ok" else 1)
 
     else:
         parser.print_help()
@@ -1075,7 +2132,7 @@ def _cli():
 if __name__ == "__main__":
     import sys
     # If run with CLI arguments, use CLI mode; otherwise start MCP server
-    if len(sys.argv) > 1 and sys.argv[1] in ("read", "batch", "list", "ranges", "--help", "-h"):
+    if len(sys.argv) > 1 and sys.argv[1] in ("read", "batch", "list", "ranges", "search", "audit", "--help", "-h"):
         _cli()
     else:
         mcp.run(transport="stdio")
