@@ -11,7 +11,7 @@ WebSearch → batch_read_urls → .web_cache/ → Haiku agents → Read ranges
 ```
 
 1. **WebSearch** (built-in) discovers URLs and returns summaries
-2. **batch_read_urls** fetches all pages in parallel (8 threads) via [Jina Reader](https://r.jina.ai), strips junk (nav, cookies, ads, sidebars — 30+ CSS selectors), and caches clean markdown to `{project}/.web_cache/`
+2. **batch_read_urls** fetches all pages in parallel (8 threads) via [Jina Reader](https://r.jina.ai), rendered in Jina's headless browser with images kept, and caches clean markdown to `{project}/.web_cache/`
 3. **Parallel Haiku agents** scan each cached page and return structured JSON with relevant line ranges
 4. **Read** pulls only those ranges into the main context
 
@@ -65,6 +65,8 @@ Get-Content claude-md-snippet.md | Add-Content "$env:USERPROFILE\.claude\CLAUDE.
 | `read_url` | Fetch a single URL (same caching behavior) |
 | `list_cache` | List all cached pages with metadata |
 
+The same file is a command line tool: `uv run --script web-sieve.py read URL`, `... batch URL ...` and `... list`, each with `--cache-dir`, print the same metadata as JSON (`read --print` prints the cached markdown instead). With no arguments it starts the MCP server.
+
 ## Cache format
 
 Pages are cached as `.web_cache/{sha256[:12]}.md` with YAML frontmatter:
@@ -95,22 +97,19 @@ Haiku triage runs in parallel — latency is ~3-5s regardless of page count.
 
 ## What gets stripped
 
-30+ CSS selectors remove common junk before caching:
+web-sieve sends no CSS selectors (no `X-Remove-Selector` or `X-Target-Selector`), so what is removed is what Jina Reader's own extraction removes. Every request carries:
 
-- Navigation (nav, header, footer)
-- Cookie/consent banners
-- Newsletter/subscribe popups
-- Modals and overlays
-- Sidebar widgets
-- Ads, sponsors, promos
-- Social share buttons
-- Comment sections
-- All images (`X-Retain-Images: none`)
+- `Accept: text/markdown`
+- `X-Engine: browser`: Jina renders the page in headless Chrome, so client-side JavaScript runs before extraction. On the pages tested this fixed truncation of long pages and kept inline chart captions, source lines and disclaimer text.
+- `X-Retain-Images: all`: image markdown (`![alt](url)`) is kept, so figure placement, chart captions and source lines stay next to their images in the cached page.
+- `Authorization: Bearer <JINA_API_KEY>` when the key is set.
+
+Jina's documentation (jina.ai/reader) says its default extraction strips boilerplate such as navigation, headers, footers and ads and converts the main content to markdown. Links are kept as `[text](url)`. A request waits up to 180 s.
 
 ## Limitations
 
 - **Cloudflare-protected sites** (Medium, HN) may return challenge pages. Skip these.
-- **Nav-heavy sites** may still have junk despite CSS stripping.
+- **Nav-heavy sites** may still have navigation in the cached page: Jina's extraction does not remove all of it, and web-sieve sends no selectors of its own.
 - **Restart required** after editing `web-sieve.py` — restart Claude Code to apply changes.
 - **`cache_dir` must be absolute** — the MCP server's working directory may differ from your project.
 

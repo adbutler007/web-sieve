@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["mcp[cli]"]
+# dependencies = ["mcp[cli]<2"]
 # ///
 """web-sieve: MCP server that fetches web pages as clean markdown via Jina Reader API, with project-level caching."""
 
@@ -19,49 +19,22 @@ mcp = FastMCP("web-sieve")
 
 API_KEY = os.environ.get("JINA_API_KEY", "")
 
-# CSS selectors for common junk to strip before extraction
-REMOVE_SELECTORS = ", ".join([
-    "nav",
-    "footer",
-    "header",
-    "[role='banner']",
-    "[role='navigation']",
-    "[role='contentinfo']",
-    "[class*='cookie']",
-    "[class*='consent']",
-    "[class*='newsletter']",
-    "[class*='subscribe']",
-    "[class*='signup']",
-    "[class*='sign-up']",
-    "[class*='popup']",
-    "[class*='modal']",
-    "[class*='overlay']",
-    "[class*='sidebar']",
-    "[class*='widget']",
-    "[class*='advert']",
-    "[class*='sponsor']",
-    "[class*='promo']",
-    "[class*='related-post']",
-    "[class*='share']",
-    "[class*='social']",
-    "[class*='comment']",
-    "[id*='cookie']",
-    "[id*='consent']",
-    "[id*='newsletter']",
-    "[id*='popup']",
-    "[id*='modal']",
-    "[id*='sidebar']",
-    "[id*='ad-']",
-    "[id*='ads']",
-])
-
-
-def _headers():
+def _headers() -> dict[str, str]:
+    # Use browser rendering with the standard markdown formatter.
+    #
+    # For the pages we care about, this produced the best fidelity:
+    # - fixed truncation on long pages where the plain path cut off early
+    # - preserved inline chart captions, source lines, and disclaimer text
+    # ReaderLM-v2 was more semantic and tended to drop some exact source /
+    # disclaimer language that we want cached verbatim.
     h = {
         "Accept": "text/markdown",
         "User-Agent": "web-sieve/1.0",
-        "X-Remove-Selector": REMOVE_SELECTORS,
-        "X-Retain-Images": "none",
+        "X-Engine": "browser",
+        # Preserve image markdown so figure placement survives in the cached
+        # page. This helps when auditing inline chart captions, sources, and
+        # surrounding disclaimer language.
+        "X-Retain-Images": "all",
     }
     if API_KEY:
         h["Authorization"] = f"Bearer {API_KEY}"
@@ -139,10 +112,9 @@ def _fetch_one(url: str, cache_dir: str) -> dict:
             "chars": len(body),
         }
 
-    # Fetch from Jina Reader
-    req = urllib.request.Request(f"https://r.jina.ai/{url}", headers=_headers())
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        req = urllib.request.Request(f"https://r.jina.ai/{url}", headers=_headers())
+        with urllib.request.urlopen(req, timeout=180) as resp:
             body = resp.read().decode("utf-8")
     except urllib.error.HTTPError as e:
         err_body = e.read().decode("utf-8", errors="replace")
@@ -239,5 +211,69 @@ def list_cache(cache_dir: str = ".web_cache") -> str:
     return json.dumps(entries)
 
 
+def _cli():
+    """CLI entrypoint: web-sieve read|batch|list — same caching as the MCP server."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="web-sieve",
+        description="Fetch web pages as clean markdown via Jina Reader API, with project-level caching.",
+    )
+    sub = parser.add_subparsers(dest="command")
+
+    # read <url> [--cache-dir]
+    p_read = sub.add_parser("read", help="Fetch a single URL, cache to disk, print metadata JSON")
+    p_read.add_argument("url", help="URL to fetch")
+    p_read.add_argument("--cache-dir", default=".web_cache", help="Cache directory (default: .web_cache)")
+    p_read.add_argument("--print", "-p", action="store_true", dest="print_content",
+                        help="Print the cached markdown content instead of metadata")
+
+    # batch <url> [<url> ...] [--cache-dir]
+    p_batch = sub.add_parser("batch", help="Fetch multiple URLs in parallel, cache to disk")
+    p_batch.add_argument("urls", nargs="+", help="URLs to fetch")
+    p_batch.add_argument("--cache-dir", default=".web_cache", help="Cache directory (default: .web_cache)")
+
+    # list [--cache-dir]
+    p_list = sub.add_parser("list", help="List all cached pages with metadata")
+    p_list.add_argument("--cache-dir", default=".web_cache", help="Cache directory (default: .web_cache)")
+
+    args = parser.parse_args()
+
+    if args.command == "read":
+        result = _fetch_one(args.url, args.cache_dir)
+        if "error" not in result:
+            _update_manifest(args.cache_dir)
+        if args.print_content and "path" in result:
+            with open(result["path"]) as f:
+                content = f.read()
+            # Skip the frontmatter
+            body_start = content.find("\n---\n")
+            print(content[body_start + 5:] if body_start != -1 else content)
+        else:
+            print(json.dumps(result, indent=2))
+
+    elif args.command == "batch":
+        results = []
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = {pool.submit(_fetch_one, url, args.cache_dir): url for url in args.urls}
+            for future in as_completed(futures):
+                results.append(future.result())
+        order = {url: i for i, url in enumerate(args.urls)}
+        results.sort(key=lambda r: order.get(r.get("url", ""), len(args.urls)))
+        _update_manifest(args.cache_dir)
+        print(json.dumps(results, indent=2))
+
+    elif args.command == "list":
+        print(list_cache(args.cache_dir))
+
+    else:
+        parser.print_help()
+
+
 if __name__ == "__main__":
-    mcp.run(transport="stdio")
+    import sys
+    # If run with CLI arguments, use CLI mode; otherwise start MCP server
+    if len(sys.argv) > 1 and sys.argv[1] in ("read", "batch", "list", "--help", "-h"):
+        _cli()
+    else:
+        mcp.run(transport="stdio")
