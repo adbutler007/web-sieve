@@ -559,7 +559,7 @@ The full outputs are saved, not just the summary, per the owner's rule that eval
 
 ### 15.5 Decision rule
 
-1. For each configuration, take the highest threshold at which pooled line recall is at least 0.90.
+1. For each configuration, take the highest threshold at which pooled line recall is at least 0.90, recall is at least the Haiku baseline's minus 0.02, and there are no page misses (revised 2026-10-05; before that, the recall and page-miss conditions were checked only in step 3, after the threshold was fixed, so a configuration could be represented by a point that could not be adopted).
 2. Among configurations, choose the one with the highest precision at its threshold. If two are within 0.02 of each other, choose the one with fewer requests.
 3. Adopt the result and replace the Haiku step in the recipe only if all of these hold:
    - pooled line recall at the chosen point is at least the Haiku baseline's recall minus 0.02;
@@ -594,7 +594,7 @@ The full outputs are saved, not just the summary, per the owner's rule that eval
 - Haiku baseline: precision 0.788, recall 0.960. Labeller agreement F1 0.884.
 - Section line (rule 7): at 0.80 recall 0.965 with and without, precision 0.523 against 0.504, so the line is kept.
 - Threshold: the highest threshold with recall of at least 0.90 for C2h is 0.80, and there all three conditions of step 3 hold (recall 0.965 against 0.940, no page misses, median 0.42 s). `DEFAULT_THRESHOLD` stays 0.80.
-- The decision block over the three configurations together prints `adopt: false`: step 1 gives C2 at 0.85 (recall 0.925), step 2 prefers it to C2h at 0.80 (precision 0.533 and 0.523 are within 0.02 and both need 141 requests), and C2 at 0.85 fails step 3's recall condition. See section 19, item 10.
+- With the rule as first written, the decision block over the three configurations printed `adopt: false`: step 1 gave C2 at 0.85 (recall 0.925), step 2 preferred it to C2h at 0.80, and C2 at 0.85 failed step 3's recall condition. After the revision of step 1 later that day (section 19, item 10), the same metrics choose C2h at 0.80, and the recall and page-miss checks pass. A rerun from the answers cache cannot measure wall time, so `calibrate.py` now says so in a `note` rather than failing silently; `--from-results FILE` re-runs the rule on a saved, measured run, and result files carry the time of day so a rerun never overwrites one.
 - Run-to-run variation: C1 sends the same requests as the second 2026-10-04 run. Between the two days 509 of 1,167 C1 windows and 855 of 2,058 C2 windows changed probability by more than 0.001 (95th percentile 0.04, largest 0.20 and 0.26), and 1 and 4 windows crossed 0.80. C1's precision at 0.80 moved from 0.362 to 0.353. The Section line's gain of 0.019 in precision is of the same size, so the result supports "no loss" more than "a clear gain".
 
 ## 16. Tests
@@ -783,7 +783,7 @@ Success criteria for the build: all tests pass with none skipped; the coverage i
 7. **Range granularity.** Haiku may return tighter ranges than 400-token windows can. The decision rule compares recall, and reports precision and the fraction of lines selected, so a looser but complete result is visible as such. Since 2026-10-05 windows are 200 tokens, which raised precision at 0.80 from 0.35 to 0.52 (section 15.7); Haiku's is 0.79.
 8. **`install.sh` conflict** with the Keychain wrapper (section 18.4, step 8). This spec does not fix it; it is recorded for a separate change.
 9. **Public repository.** No third-party page text and no calibration data are committed; test fixtures are synthetic.
-10. **Decision rule step order (open, 2026-10-05).** Step 1 takes each configuration's highest threshold with recall of at least 0.90 before step 3 compares recall with Haiku's, and the rule never falls back to a lower threshold. On 2026-10-05 it picked C2 at 0.85 (recall 0.925), which fails step 3, while C2h at 0.80 passes every condition. A rule that applies step 3's recall condition inside step 1 would have picked C2h at 0.80. The rule was not changed in this revision.
+10. **Decision rule step order (open, 2026-10-05).** Step 1 takes each configuration's highest threshold with recall of at least 0.90 before step 3 compares recall with Haiku's, and the rule never falls back to a lower threshold. On 2026-10-05 it picked C2 at 0.85 (recall 0.925), which fails step 3, while C2h at 0.80 passes every condition. A rule that applies step 3's recall condition inside step 1 would have picked C2h at 0.80. Fixed later on 2026-10-05: step 1 now applies the recall-versus-Haiku and page-miss conditions when choosing each configuration's threshold (`decide` in calibrate.py, tested in tests/test_calibrate_decide.py).
 11. **Run-to-run variation.** Identical requests on 2026-10-04 and 2026-10-05 gave different probabilities for about 44% of windows (95th percentile change 0.04, largest 0.26). Differences between configurations smaller than about 0.02 in precision or recall are within that variation.
 
 ## 20. Out of scope

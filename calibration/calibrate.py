@@ -221,30 +221,45 @@ def agreement(pairs_first: list, pairs_second: list) -> dict:
 
 
 def decide(metrics: dict, costs: dict, haiku: dict) -> dict:
-    """Spec 15.5: per configuration the highest threshold with pooled recall >= 0.90,
-    then the highest precision (ties within 0.02 to fewer requests), then the adoption conditions."""
+    """Spec 15.5 (revised 2026-10-05): per configuration the highest threshold at which pooled
+    recall is at least 0.90, recall is at least Haiku's minus RECALL_SLACK, and there are no page
+    misses; then the highest precision (ties within 0.02 to fewer requests); then the remaining
+    adoption condition (median wall time). A threshold that fails the recall or page-miss
+    conditions is skipped in favour of the next lower one, so a configuration is never
+    represented by a point that cannot be adopted."""
+    haiku_recall = haiku.get("recall")
+
+    def qualifies(r: dict) -> bool:
+        return (not r["bridge"] and r["recall"] is not None and r["recall"] >= MIN_RECALL
+                and not r["page_misses"]
+                and haiku_recall is not None and r["recall"] >= haiku_recall - RECALL_SLACK)
+
     candidates = []
     for name, rows in metrics.items():
-        ok = [r for r in rows if not r["bridge"] and r["recall"] is not None and r["recall"] >= MIN_RECALL]
+        ok = [r for r in rows if qualifies(r)]
         if ok:
             best = max(ok, key=lambda r: r["threshold"])
             candidates.append({"config": name, **best, "requests_needed": costs[name]["requests_needed"]})
     if not candidates:
-        return {"adopt": False, "reason": f"no configuration reaches pooled recall {MIN_RECALL} at any threshold"}
+        return {"adopt": False, "reason": (f"no configuration has a threshold with pooled recall >= {MIN_RECALL}, "
+                                           f"recall >= Haiku's minus {RECALL_SLACK} and no page misses")}
     top = max(c["precision"] or 0 for c in candidates)
     close = [c for c in candidates if (c["precision"] or 0) >= top - TIE_PRECISION]
     chosen = min(close, key=lambda c: (c["requests_needed"], -(c["precision"] or 0)))
     wall = costs[chosen["config"]]["median_wall_s"]  # None when every pair was answered from the cache
     checks = {
-        "recall_vs_haiku": haiku.get("recall") is not None and chosen["recall"] >= haiku["recall"] - RECALL_SLACK,
+        "recall_vs_haiku": chosen["recall"] >= haiku_recall - RECALL_SLACK,
         "no_page_misses": not chosen["page_misses"],
         "median_wall_s": wall is not None and wall <= MAX_MEDIAN_WALL_S,
     }
+    note = ("" if wall is not None else
+            "median wall time not measured: every pair came from the answers cache; the timing check "
+            "needs a run with uncached pairs (a new question, or --from-results on a measured run)")
     bridged = next(r for r in metrics[chosen["config"]] if r["bridge"] and r["threshold"] == chosen["threshold"])
     bridge = ((bridged["recall"] or 0) - chosen["recall"] >= BRIDGE_MIN_GAIN
               and (bridged["fraction_selected"] or 0) <= (chosen["fraction_selected"] or 0) * (1 + BRIDGE_MAX_EXTRA))
-    return {"adopt": all(checks.values()), "checks": checks, "chosen": chosen, "bridge": bridge,
-            "bridge_metrics": bridged, "haiku_recall": haiku.get("recall"),
+    return {"adopt": all(checks.values()), "checks": checks, "note": note, "chosen": chosen, "bridge": bridge,
+            "bridge_metrics": bridged, "haiku_recall": haiku_recall,
             "section_line": section_line_rule(metrics), "candidates": candidates}
 
 
@@ -280,8 +295,18 @@ def main() -> int:
     parser.add_argument("--one", action="store_true",
                         help="smoke test: one pair with the first configuration named, nothing written")
     parser.add_argument("--check", action="store_true", help="check pages.json and the labels; send nothing")
-    parser.add_argument("--out", default=os.path.join(DATA, "results", f"{date.today().isoformat()}.json"))
+    parser.add_argument("--out", default=os.path.join(DATA, "results", f"{datetime.now().strftime('%Y-%m-%dT%H%M')}.json"),
+                        help="results file; the default carries the date and time so a rerun never overwrites a measured run")
+    parser.add_argument("--from-results", metavar="FILE",
+                        help="re-run the decision rule on a saved results file and print it; sends nothing")
     args = parser.parse_args()
+
+    if args.from_results:
+        with open(args.from_results) as f:
+            saved = json.load(f)
+        decision = decide(saved["metrics"], saved["costs"], saved.get("haiku") or {})
+        print(json.dumps(decision, indent=2, default=jsonable))
+        return 0 if decision["adopt"] else 1
 
     pages = load_pages(args.root)
     if args.check and not os.path.exists(args.labels):
