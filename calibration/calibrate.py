@@ -299,7 +299,11 @@ def main() -> int:
                         help="results file; the default carries the date and time so a rerun never overwrites a measured run")
     parser.add_argument("--from-results", metavar="FILE",
                         help="re-run the decision rule on a saved results file and print it; sends nothing")
+    parser.add_argument("--no-cache", action="store_true",
+                        help="ignore cached Jev answers so every pair is sent and timed (answers are still written)")
     args = parser.parse_args()
+    if args.no_cache:
+        os.environ["WEB_SIEVE_NO_ANSWER_CACHE"] = "1"
 
     if args.from_results:
         with open(args.from_results) as f:

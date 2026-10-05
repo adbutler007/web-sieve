@@ -1230,8 +1230,13 @@ class _AnswerCache:
                                    f"were removed, but VACUUM failed: {e}")
 
     def get(self, keys: list):
-        """{key: (p, served_model)} when every key is cached, else None."""
-        if self.conn is None:
+        """{key: (p, served_model)} when every key is cached, else None.
+
+        WEB_SIEVE_NO_ANSWER_CACHE=1 makes every lookup a miss (answers are
+        still written), so a calibration run can measure request time on
+        pairs that would otherwise be served from the cache.
+        """
+        if self.conn is None or os.environ.get("WEB_SIEVE_NO_ANSWER_CACHE") == "1":
             return None
         try:
             with self.lock:
