@@ -747,15 +747,17 @@ def list_cache(cache_dir: str = ".web_cache") -> str:
 # Specification: docs/jev-relevance-spec.md.
 
 JEV_MODEL = "jev-1.13.0"          # pinned: the threshold is calibrated against one model version (docs)
-PROMPT_VERSION = 1                # increment on any change to instructions, criteria, state shape or text transform
-# Calibrated 2026-10-04 with jev-1.13.0 on 9 pages x 3 questions (calibration/data), run twice: the second run
-# replaced two pages from projects the deny list now refuses. At 0.80 line recall was 0.971 and 0.970, precision
-# 0.395 and 0.362, with no page misses and no false alarms on absent questions in either run. In the second run 0.85
-# lost gold windows scoring 0.81 and 0.82 (recall 0.940) and passed the Haiku recall check (0.960 - 0.02) by 0.0001;
-# with batch-dependent shifts of up to 0.19 measured, 0.80 is the safer cut. The spec 15.5 rule's own pick in that
-# run was 200-token windows at 0.80 (precision 0.503, recall 0.960); the window size is unchanged (README).
+# Increment on any change to instructions, criteria, state shape or text transform. 2 (2026-10-05): the Section line
+# (SECTION_LINE). Opening an answers cache prunes rows written under an older version (_AnswerCache).
+PROMPT_VERSION = 2
+# Calibrated with jev-1.13.0 on 9 pages x 3 questions (calibration/data). 2026-10-04, two runs at 400-token windows
+# with the heading path as a separate field: at 0.80 line recall 0.971 and 0.970, precision 0.395 and 0.362; 0.85 in
+# the second run passed the Haiku recall check (0.960 - 0.02) by 0.0001, so 0.80 was kept. 2026-10-05, at the current
+# defaults (200-token windows, Section line): at 0.80 recall 0.965 and precision 0.523, against 0.965 and 0.504
+# without the Section line; 0.85 drops recall to 0.851, so 0.80 is the highest threshold with recall of at least
+# 0.90 (spec 15.5, step 1). No page misses and no false alarms on absent questions at 0.80 in any run.
 DEFAULT_THRESHOLD = 0.80          # p >= threshold selects
-WINDOW_TOKENS = 400               # target window size (spec section 4); maximum 2x, minimum 1/5
+WINDOW_TOKENS = 200               # target window size (spec section 4); maximum 2x (400), minimum 1/5 (40); 400 until 2026-10-05
 WINDOWS_PER_REQUEST = 16          # as jgrep and jevpdf (spec section 5)
 JEV_CONCURRENCY = 4               # requests in flight per call; under the published rate limits (docs, 2026-10-03)
 JEV_POLICY = "default"            # jev client retry policy: 3 attempts, 20 s deadline
@@ -764,11 +766,14 @@ JEV_HEDGE_AFTER_S = 3.0           # duplicate request after 3 s; 16-window reque
 CHARS_PER_TOKEN = 3.9             # measured on JSON-encoded English markdown, 2026-10-03
 STATE_TOKEN_BUDGET = 24_000       # state plus the longest question; Jev allows 32,000 (docs)
 REQUEST_TOKEN_BUDGET = 56_000     # state plus all questions; Jev allows 64,000 (docs)
-MAX_WINDOWS = 1_000               # pages with more windows are refused; none in the 2026-10-03 survey had more
+MAX_WINDOWS = 2_000               # pages with more windows are refused; at 200 tokens the largest of 1,506 cached
+                                  # pages had 1,482 windows and 3 had over 1,000 (survey 2026-10-05)
 MAX_QUESTION_CHARS = 2_000        # longest question accepted
 PRICE_PER_MTOK_USD = 0.042        # input price per million tokens; output is free (docs, 2026-10-03)
 LONG_LINE_CHARS = 2_000           # lines longer than this inside a selected range are listed in long_lines
 STRIP_LINKS = True                # reduce link markup in the text sent (spec section 4.5)
+SECTION_LINE = True               # the text sent for a window starts with "Section: <heading path>" (spec section 6.1)
+SECTION_CAP_CHARS = 160           # longest heading path in that line; top-level headings are dropped first
 NOUL_INSTRUCTIONS = "Look only at `windows.{wid}`. Does it contain information that helps answer `question`?"
 NOUL_CRITERIA = {
     "true": ("The window states facts, definitions, numbers, steps, examples or arguments that someone "
@@ -951,13 +956,37 @@ def _line_info(lines: list, first: int) -> tuple:
     return headings, protected, paths
 
 
-def _label(path: tuple, strip_links: bool) -> str:
-    """Heading path joined with ' > ', each heading cut to 80 characters."""
+def _label_parts(path: tuple, strip_links: bool) -> list:
+    """The heading texts of a path, links reduced with strip_links, each cut to 80 characters."""
     parts = []
     for text in path:
         text = (_reduce_links(text) if strip_links else text).strip()
         parts.append(text[:80] + "…" if len(text) > 80 else text)
-    return " > ".join(parts)
+    return parts
+
+
+def _label(path: tuple, strip_links: bool) -> str:
+    """Heading path joined with ' > ', each heading cut to 80 characters."""
+    return " > ".join(_label_parts(path, strip_links))
+
+
+def _heading_path(path: tuple, strip_links: bool) -> str:
+    """The heading path written in a window's Section line (spec section 6.1).
+
+    The nearest heading and its parent headings up to the top level, joined
+    with ' > ', each heading cut to 80 characters as in _label. When the
+    joined path is longer than SECTION_CAP_CHARS, the top-level headings are
+    dropped first and replaced by one '…', so the nearest heading is always
+    kept. A window before the first heading gets '(none)'.
+    """
+    parts = _label_parts(path, strip_links)
+    if not any(parts):
+        return "(none)"
+    dropped = []
+    while len(parts) > 1 and len(" > ".join(dropped + parts)) > SECTION_CAP_CHARS:
+        parts.pop(0)
+        dropped = ["…"]
+    return " > ".join(dropped + parts)
 
 
 def _split_line(line: str, limit: int) -> list:
@@ -989,8 +1018,11 @@ def _windows(lines: list, body_start: int, window_tokens: int = WINDOW_TOKENS, *
              strip_links: bool = STRIP_LINKS) -> list:
     """The windows of a page body, in order (spec section 4.4).
 
-    Each window is {"id", "start", "end", "section", "text", "tokens"} with
-    1-based inclusive file line numbers. A segment of a line too long for one
+    Each window is {"id", "start", "end", "section", "heading", "text",
+    "tokens"} with 1-based inclusive file line numbers. "section" is the
+    label reported in range_detail and "heading" the heading path for the
+    Section line (_heading_path); both describe the heading path in force at
+    the window's first non-blank line. A segment of a line too long for one
     window also has "line" (that line's number) and "span" (its character
     span). Windows cover every body line exactly once. A body with no
     non-blank line has no windows.
@@ -1063,6 +1095,7 @@ def _windows(lines: list, body_start: int, window_tokens: int = WINDOW_TOKENS, *
         w["text"] = _reduce_links(text) if strip_links else text
         anchor = w.get("line") or next(j for j in range(w["start"], w["end"] + 1) if lines[j - 1].strip())
         w["section"] = _label(paths[anchor - 1], strip_links)
+        w["heading"] = _heading_path(paths[anchor - 1], strip_links)
     return wins
 
 
@@ -1077,9 +1110,15 @@ def _sha(value) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-def _batches(windows: list, question: str, page_meta: dict, batch_size: int = WINDOWS_PER_REQUEST) -> list:
+def _batches(windows: list, question: str, page_meta: dict, batch_size: int = WINDOWS_PER_REQUEST,
+             section_line: bool = SECTION_LINE) -> list:
     """Jev requests for one page (spec sections 5, 6 and 12).
 
+    A window's state entry is {"text"} whose first line is "Section:
+    <heading path>" with section_line, else {"section", "text"} with the
+    label in its own field. The Section line exists only in the request:
+    window text, line numbers and ranges never include it. The entry as
+    sent is what the answer-cache key hashes, so the heading is part of it.
     Windows go in document order, at most batch_size per request; a request
     closes early when one more window would take it over STATE_TOKEN_BUDGET
     or REQUEST_TOKEN_BUDGET, so every window is still asked. A window over
@@ -1091,7 +1130,8 @@ def _batches(windows: list, question: str, page_meta: dict, batch_size: int = WI
     base = _est_tokens(json.dumps({"question": question, "page": page, "windows": {}}, ensure_ascii=False))
     groups, cur = [], []
     for w in windows:
-        entry = {"section": w["section"], "text": w["text"]}
+        entry = ({"text": f"Section: {w['heading']}\n{w['text']}"} if section_line
+                 else {"section": w["section"], "text": w["text"]})
         item = (w["id"], entry, _est_tokens(json.dumps({w["id"]: entry}, ensure_ascii=False)),
                 _est_tokens(json.dumps({w["id"]: _noul(w["id"])}, ensure_ascii=False)))
         if cur:
@@ -1130,25 +1170,64 @@ def _batches(windows: list, question: str, page_meta: dict, batch_size: int = WI
 class _AnswerCache:
     """Jev answers in sqlite, keyed by sha256 (spec section 12).
 
-    Stores only the key, p, the served model and a timestamp: no page text,
-    question or API key. A sqlite error never stops a call; its text is kept
-    in `errors` and reported as a warning.
+    Stores only the key, p, the served model, a timestamp and the prompt
+    version: no page text, question or API key. The key holds
+    PROMPT_VERSION, so rows written under an older version can never be
+    read again; opening a file last pruned for an older version deletes
+    them and vacuums the file (_prune), so it does not grow with dead rows.
+    A sqlite error never stops a call; its text is kept in `errors` and
+    reported as a warning.
     """
 
     def __init__(self, directory: str):
         self.path = os.path.join(directory, ANSWERS_DB)
         self.lock = threading.Lock()
         self.errors = []
+        self.pruned = 0
         self.conn = None
         try:
             conn = sqlite3.connect(self.path, timeout=5, check_same_thread=False)
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("CREATE TABLE IF NOT EXISTS answers (key TEXT PRIMARY KEY, p REAL NOT NULL, "
-                         "served_model TEXT NOT NULL, created_at TEXT NOT NULL)")
+                         "served_model TEXT NOT NULL, created_at TEXT NOT NULL, "
+                         "prompt_version INTEGER NOT NULL DEFAULT 1)")
             conn.commit()
+            self._prune(conn)
             self.conn = conn
         except sqlite3.Error as e:
             self.errors.append(f"answers cache {self.path} unusable, results computed without it: {e}")
+
+    def _prune(self, conn) -> None:
+        """Delete the rows of older prompt versions once per version.
+
+        PRAGMA user_version holds the PROMPT_VERSION the file was last pruned
+        for; when it is current, nothing is written. Otherwise, under one
+        write lock: a file from before the prompt_version column gains it
+        (its rows count as version 1), rows with an older version are
+        deleted, user_version is set, and the file is vacuumed when rows
+        were deleted. A failed VACUUM is a warning: the rows are gone and
+        the file shrinks on a later prune.
+        """
+        if conn.execute("PRAGMA user_version").fetchone()[0] >= PROMPT_VERSION:
+            return
+        conn.execute("BEGIN IMMEDIATE")  # another process migrating the same file waits here (timeout 5 s)
+        try:
+            if conn.execute("PRAGMA user_version").fetchone()[0] < PROMPT_VERSION:
+                if "prompt_version" not in {row[1] for row in conn.execute("PRAGMA table_info(answers)")}:
+                    conn.execute("ALTER TABLE answers ADD COLUMN prompt_version INTEGER NOT NULL DEFAULT 1")
+                self.pruned = conn.execute("DELETE FROM answers WHERE prompt_version < ?",
+                                           (PROMPT_VERSION,)).rowcount
+                conn.execute(f"PRAGMA user_version = {int(PROMPT_VERSION)}")
+            conn.commit()
+        except sqlite3.Error:
+            conn.rollback()
+            raise
+        if self.pruned:
+            try:
+                conn.execute("VACUUM")
+            except sqlite3.Error as e:
+                self.errors.append(f"answers cache {self.path}: {self.pruned} rows of older prompt versions "
+                                   f"were removed, but VACUUM failed: {e}")
 
     def get(self, keys: list):
         """{key: (p, served_model)} when every key is cached, else None."""
@@ -1172,8 +1251,9 @@ class _AnswerCache:
         now = datetime.now(timezone.utc).isoformat()
         try:
             with self.lock, self.conn:
-                self.conn.executemany("INSERT OR REPLACE INTO answers VALUES (?, ?, ?, ?)",
-                                      [(key, p, served, now) for key, p, served in rows])
+                self.conn.executemany("INSERT OR REPLACE INTO answers (key, p, served_model, created_at, "
+                                      "prompt_version) VALUES (?, ?, ?, ?, ?)",
+                                      [(key, p, served, now, PROMPT_VERSION) for key, p, served in rows])
         except sqlite3.Error as e:
             self.errors.append(f"answers cache {self.path} could not be written: {e}")
 
@@ -1434,10 +1514,10 @@ def _source_denied(source: str, cache_dir: str, warnings: list) -> str | None:
 
 def _relevance(question, sources, cache_dir=".web_cache", threshold=None, window_tokens=WINDOW_TOKENS,
                max_windows=MAX_WINDOWS, *, batch_size=WINDOWS_PER_REQUEST, strip_links=STRIP_LINKS,
-               max_age_days=None, refresh=False) -> list:
+               section_line=SECTION_LINE, max_age_days=None, refresh=False) -> list:
     """Judge every window of every source with Jev; one result per source, in
     input order (spec section 3.4). Used by find_relevant_ranges, the CLI and
-    calibration/calibrate.py; batch_size and strip_links are for calibration.
+    calibration/calibrate.py; batch_size, strip_links and section_line are for calibration.
     A source on the Jev deny list gets status "denied" and sends nothing;
     max_age_days and refresh apply to URL sources (effectiveness spec 3 and 6)."""
     started = time.monotonic()
@@ -1514,7 +1594,7 @@ def _relevance(question, sources, cache_dir=".web_cache", threshold=None, window
                 continue
             r.update(url=meta["url"], title=meta["title"], file_lines=len(lines))
             wins = _windows(lines, body_start, window_tokens, strip_links=strip_links)
-            batches = _batches(wins, question, meta, batch_size)
+            batches = _batches(wins, question, meta, batch_size, section_line)
             if len(wins) > max_windows:
                 _set_error(r, "too_many_windows", f"{len(wins)} windows would need {len(batches)} requests; "
                                                   f"max_windows is {max_windows}; nothing was sent")
@@ -1652,7 +1732,9 @@ def find_relevant_ranges(question: str, sources: list[str], cache_dir: str = ".w
 # Specification: docs/effectiveness-spec.md, section 5.
 
 SEARCH_INDEX_DB = "search_index.sqlite"  # in the .web_cache/ directory it indexes
-SEARCH_INDEX_VERSION = 1                 # increment when tokenising or the stored shape changes
+# Increment when tokenising or the stored shape changes. The stored version string also holds WINDOW_TOKENS,
+# STRIP_LINKS and TITLE_WEIGHT, so a change to any of them rebuilds the index too. 2 (2026-10-05): 200-token windows.
+SEARCH_INDEX_VERSION = 2
 BM25_K1 = 1.2                            # spec section 5
 BM25_B = 0.75                            # spec section 5
 TITLE_WEIGHT = 2                         # title tokens are counted this many times in every window of the page

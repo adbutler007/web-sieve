@@ -2,6 +2,8 @@
 
 Written 2026-10-03. Status: implemented 2026-10-03; the threshold was calibrated on 2026-10-04 (README, "Threshold and calibration"). Every file change it describes is listed in section 18.
 
+Revised 2026-10-05: windows of 200 tokens (maximum 400, minimum 40) instead of 400; the heading path sent as a first `Section:` line of each window's text instead of a separate `section` field; `max_windows` 2,000 instead of 1,000; prompt version 2, with old answer rows pruned; search index version 2. The revised parts are sections 1, 2.3, 3, 4.4, 4.7, 5, 6, 12, 14, 15 and 19; the 2026-10-05 calibration result is in section 15.7.
+
 ## 0. Purpose and terms
 
 The current web recipe finds the useful parts of a cached page by sending one Haiku agent per page and asking for `{"relevant": bool, "ranges": [[start, end]]}`. This spec replaces that step with a web-sieve tool that asks TypeSafe's Jev one yes/no question per window of the page and returns the line ranges whose probability is at or above a threshold. Jev cannot return line ranges, so code defines the windows, and code turns per-window probabilities into ranges.
@@ -19,10 +21,11 @@ Terms used in this document:
 
 | Item | Decision |
 |---|---|
-| MCP tool | `find_relevant_ranges(question, sources, cache_dir=".web_cache", threshold=None, window_tokens=400, max_windows=1000)` |
+| MCP tool | `find_relevant_ranges(question, sources, cache_dir=".web_cache", threshold=None, window_tokens=200, max_windows=2000)` (400 and 1000 until 2026-10-05) |
 | CLI subcommand | `web-sieve ranges "QUESTION" SOURCE [SOURCE ...] [--cache-dir DIR] [--threshold T] [--window-tokens N] [--max-windows N]` |
 | Output | JSON list, one object per source, in input order: `status`, `relevant`, `ranges`, `windows` as `[start, end, p]`, `unjudged`, usage, cost |
-| Windows | target 400 tokens, maximum 800, minimum 80; break before headings, and at a blank line once the target is reached; never inside a code fence or table unless the maximum is reached; no overlap |
+| Windows | target 200 tokens, maximum 400, minimum 40 (400, 800 and 80 until 2026-10-05); break before headings, and at a blank line once the target is reached; never inside a code fence or table unless the maximum is reached; no overlap |
+| State | each window's text starts with `Section: <heading path>` (section 6.1); until 2026-10-05 the path was a separate `section` field |
 | Batching | 16 windows per request under named keys `windows.w001`, `windows.w002`, ...; one Noul per window; 4 requests in flight |
 | Second question | none in v1; page-level `relevant` is computed in code from window probabilities (section 8) |
 | Threshold | `p >= 0.5` provisional, replaced by the calibrated value (section 15); every window's `p` is returned so a caller can re-threshold without a new request |
@@ -30,7 +33,7 @@ Terms used in this document:
 | Jev client | load `~/.local/bin/jev` with importlib from its real path, lazily, as other local tools that use the client do; do not vendor it; no new dependencies |
 | Key | `jev.resolve_key()` (environment `JEV_API_KEY`, else Keychain service `JEV_API_KEY`), resolved once per call and passed to `ask(key=...)`; never logged or returned |
 | Failure | a failed request is never reported as "not relevant"; `status` becomes `partial` or `error`, `relevant` is `null` unless a judged window passed, and `unjudged` lists the lines not judged; no new requests after the first non-transient failure or give-up |
-| Cache | `jev_answers.sqlite` in the page's `.web_cache/` directory; one row per window answer keyed by model, prompt version, question, window and batch; no page text stored |
+| Cache | `jev_answers.sqlite` in the page's `.web_cache/` directory; one row per window answer keyed by model, prompt version, question, window (with its Section line) and batch; no page text stored; rows of older prompt versions pruned on open (section 12) |
 | Files | stays a single file; about 300 added lines in `web-sieve.py`, plus `tests/` and `calibration/calibrate.py` |
 
 ## 2. Measured facts this spec relies on
@@ -92,6 +95,16 @@ Other counts that drive the design:
 - Link markup removal and preamble removal shrink the median page to 85% of its characters.
 - No page exceeds 1,000 windows at the default size.
 
+Survey of 2026-10-05, after the audit had quarantined challenge and empty pages: 1,506 readable cached pages under `~/Projects`, windowed at both sizes with the code of that date (local only, nothing sent). The partition invariant (every body line in exactly one window) held for every page at both sizes.
+
+| Statistic | p10 | p50 | p90 | p99 | max |
+|---|---|---|---|---|---|
+| Windows at 400 tokens | 1 | 6 | 36 | 155 | 759 |
+| Windows at 200 tokens | 1 | 10 | 57 | 273 | 1,482 |
+| Requests at 200 tokens, 16 windows each | 1 | 1 | 4 | 18 | 93 |
+
+At 200 tokens 3 pages have more than 1,000 windows and none has more than 2,000, which is why `max_windows` became 2,000.
+
 ## 3. Surface
 
 ### 3.1 MCP tool
@@ -99,9 +112,11 @@ Other counts that drive the design:
 ```python
 @mcp.tool()
 def find_relevant_ranges(question: str, sources: list[str], cache_dir: str = ".web_cache",
-                         threshold: float | None = None, window_tokens: int = 400,
-                         max_windows: int = 1000) -> str:
+                         threshold: float | None = None, window_tokens: int = 200,
+                         max_windows: int = 2000) -> str:
 ```
+
+(400 and 1000 until 2026-10-05. The tool also takes `max_age_days` and `refresh`; effectiveness spec, section 3.)
 
 Docstring (this is the text Claude reads; keep it to this content):
 
@@ -128,7 +143,7 @@ web-sieve ranges "QUESTION" SOURCE [SOURCE ...] [--cache-dir DIR] [--threshold T
 - `question`: stripped; empty or over 2,000 characters is a usage error (no requests sent).
 - `threshold`: `None` means `DEFAULT_THRESHOLD`; otherwise must satisfy `0 <= threshold <= 1`, else usage error.
 - `window_tokens`: integer from 50 to 4,000, else usage error. Maximum window size is `2 x window_tokens`; minimum is `window_tokens // 5`.
-- `max_windows`: positive integer. A page with more windows than this returns `status: "error"`, `kind: "too_many_windows"`, with the window count and the request count it would need, and no requests are sent for it. No page in the current cache reaches 1,000 windows.
+- `max_windows`: positive integer. A page with more windows than this returns `status: "error"`, `kind: "too_many_windows"`, with the window count and the request count it would need, and no requests are sent for it. The default is 2,000: at 200-token windows the largest of 1,506 cached pages surveyed on 2026-10-05 had 1,482 windows (93 requests, about 24 rounds at concurrency 4), and 3 had more than 1,000 (section 2.3).
 - A source that starts with `http://` or `https://` is a URL: it resolves through `_fetch_one(url, cache_dir)`, which returns the cached path or fetches it, and the manifest is rebuilt once at the end of the call if anything was fetched. A fetch error becomes that source's `status: "error"`, `kind: "fetch_failed"`; other sources continue, as in `batch_read_urls`.
 - Any other source is a path. It must exist, sit in a directory named `.web_cache`, and start with web-sieve frontmatter containing a `url:` line. Otherwise `kind: "not_a_cached_page"` (or `not_found`). This restriction is what makes the privacy statement in section 13 true: the tool cannot send an arbitrary local file to TypeSafe.
 
@@ -233,7 +248,7 @@ The heading path is a stack of `(level, text)`. A heading of level `n` removes e
 
 ### 4.4 Building windows
 
-With `target = window_tokens`, `max = 2 x target`, `min = target // 5`, walk the body lines in order and keep a current window:
+With `target = window_tokens`, `max = 2 x target`, `min = target // 5`, walk the body lines in order and keep a current window. At the default of 200 (since 2026-10-05) the maximum is 400 and the minimum 40. Both stay proportional to the target, as this formula defines them; nothing in this spec ties the maximum to 800. The consequences of the smaller maximum: a line over 400 estimated tokens (about 1,560 ASCII characters) is now split into segments, so every line longer than `LONG_LINE_CHARS` (2,000) is split, and a code fence or table over 400 tokens is now split. Neither loses text, and a selected segment selects its whole line.
 
 1. **Oversize line** (`_est_tokens(line) > max`): close the current window if it has content. Split the line into segments of at most `max` tokens, cutting at the last whitespace in the final 20% of each segment, or exactly at the limit when there is none. Each segment is its own window with `start = end = line number` and a character span recorded in `split_lines`. Nothing is dropped.
 2. **Heading line**: if the current window has at least `min` tokens, close it, so the heading starts the next window. A heading never ends a window except as part of an oversize split.
@@ -261,11 +276,13 @@ Windows do not overlap. Overlap would send most text twice and let one line belo
 
 The probe page in section 2.2 (73,357 characters, 454 file lines; close to the 69k-character, 386-line page described as typical) has lines 1 to 6 as frontmatter and lines 7 to 11 as preamble, so the body starts at line 12. At 400 tokens it gives 53 windows and 62,122 characters of window text after link reduction. These go out as 4 requests of 16, 16, 16 and 5 windows, all in flight at once (concurrency 4): 7,095, 8,048, 7,327 and 2,560 input tokens, 521 ms wall time, $0.00105.
 
+At 200 tokens with the Section line (2026-10-05; the cached copy had changed to 453 file lines), the same page gives 86 windows in 6 requests (16, 16, 16, 16, 16 and 6 windows). Calibration page 1 is this page: the three questions took 30,934 to 30,982 input tokens each (about $0.0013) and 0.41 to 0.56 s, against 24,878 to 24,910 tokens and 0.25 to 0.37 s at 400 tokens in the same run.
+
 ## 5. Batching and budgets
 
 - Constant `WINDOWS_PER_REQUEST = 16`, the figure used by jgrep and jevpdf (16 per request), close to jevgrep's 20. Windows are batched in document order, so each batch holds neighbouring windows.
 - Budget check per request, using `_est_tokens` on the JSON text: state plus the longest question at most `STATE_TOKEN_BUDGET = 24,000` (Jev allows 32,000), and state plus all questions at most `REQUEST_TOKEN_BUDGET = 56,000` (Jev allows 64,000). The 25% margin covers estimation error.
-- At default settings the budget never binds: 16 windows at the 800-token maximum plus the question and title is about 13,800 tokens of state, and 16 Nouls add about 2,200.
+- At default settings the budget never binds. At 200-token windows (since 2026-10-05), 16 windows at the 400-token maximum, each with a Section line of at most 169 characters, plus a 2,000-character question and the title is about 7,800 estimated tokens of state, and 16 Nouls add about 2,200. Over the 1,506 cached pages surveyed on 2026-10-05, with a 2,000-character question, the largest request was 7,753 estimated tokens of state plus its longest question (budget 24,000) and 10,213 with all its questions (budget 56,000).
 - The budget binds only with a large `window_tokens` or with non-Latin text. Then a batch closes early and the next batch starts with the window that did not fit. Every window is still asked. A single window is at most `2 x 4,000 = 8,000` tokens of line text, so one window normally fits on its own.
 - A window that is over the budget on its own (possible only when JSON escaping or a very long page title or URL inflates the state) is not sent, because Jev would refuse it with 422 and the fail-fast rule (section 11) would then stop every other batch in the call. Its lines are listed in `unjudged` with `reason: "over_budget"`, a warning names the window, the page's `status` becomes `partial` (or `error` when no other window was judged), and the other windows and pages proceed. A Jev failure on the same page takes precedence over `over_budget` for the page's `error.kind`.
 - If Jev still returns 422 (the estimate was wrong), that is a client error, reported as such (section 11). It is not retried with smaller batches.
@@ -281,11 +298,20 @@ The probe page in section 2.2 (73,357 characters, 454 file lines; close to the 6
   "question": "How do I stop Claude Code from running one specific Bash command, such as git push?",
   "page": {"title": "Configure permissions - Claude Code Docs"},
   "windows": {
-    "w009": {"section": "Permission rule syntax > Use specifiers for fine-grained control", "text": "..."},
-    "w010": {"section": "Permission rule syntax > Match by input parameter", "text": "..."}
+    "w009": {"text": "Section: Permission rule syntax > Use specifiers for fine-grained control\n..."},
+    "w010": {"text": "Section: Permission rule syntax > Match by input parameter\n..."}
   }
 }
 ```
+
+The Section line (revised 2026-10-05; constant `SECTION_LINE = True`):
+
+- The first line of every window's `text` is `Section: <heading path>`, followed by the window's own lines (section 4.5).
+- The heading path is the path in force at the window's first non-blank line (section 4.3): the nearest preceding ATX or setext heading and its parent headings up to the top level, joined with ` > `. When the window starts with a heading, that heading is the nearest one. A `#` line or an underlined line inside a code fence is not a heading.
+- Each heading is cut to 80 characters with a trailing `…`, as in the section label. When the joined path is longer than `SECTION_CAP_CHARS = 160`, the top-level headings are dropped first and replaced by one `…` (`… > B > C`), so the nearest heading, which says most about the window, is always kept. A window above the first heading, or on a page with no headings, gets `Section: (none)`.
+- The line exists only in the request. Window line numbers, `ranges`, `range_detail`, the window text that `search_cache` indexes and the cached file never contain it.
+- It is part of the state entry that the answer-cache key hashes (section 12), so the same text under a different heading is a different key.
+- Why: at 200-token windows many windows start in the middle of a section, below the heading that names it. Before 2026-10-05 the same path went in a separate `section` field next to `text`. The line puts the heading in the text Jev reads, and replaces the field, so the heading is sent once. With `SECTION_LINE = False` the entry is the earlier `{"section", "text"}` form, which calibration uses as the comparison (configurations C2 and C2h, section 15.4). On 2026-10-05 the line kept recall and raised precision slightly (section 15.7).
 
 - Named keys, not a list: jevgrep reports F1 0.904 with named lines against 0.754 with list indexing, because answers stop leaking between neighbours.
 - Shared context: the question and the page title. When the title is empty (for example, docs.typesafe.ai pages), the page URL is sent as `page.url` instead.
@@ -309,7 +335,7 @@ Question id = window id. For window `w009`:
 
 - "Helps answer, even if only part of it" asks for evidence rather than topic match, and accepts partial answers, which favours recall. The Jev docs say the model reads instructions literally, so the criteria name the false cases explicitly (other subject, keyword match without content, navigation, empty heading).
 - The last sentence of the false criterion addresses page text that argues for its own relevance. It is a mitigation, not a guarantee. The cost of a miss is a few extra lines read, because the tool takes no action on the answer.
-- Constant `PROMPT_VERSION = 1`. Any change to the instructions, criteria, state shape or text transform increments it, which invalidates cached answers (section 12) and requires recalibration.
+- Constant `PROMPT_VERSION`. Any change to the instructions, criteria, state shape or text transform increments it, which invalidates cached answers (section 12) and requires recalibration. It was 1 until 2026-10-05 and is 2 since the Section line.
 
 ## 7. Thresholds and ranges
 
@@ -410,17 +436,19 @@ web-sieve adds no retries of its own and never re-sends a failed batch with diff
 
 ```sql
 CREATE TABLE IF NOT EXISTS answers (
-  key          TEXT PRIMARY KEY,  -- sha256 hex, see below
-  p            REAL NOT NULL,
-  served_model TEXT NOT NULL,     -- the response's "model" field
-  created_at   TEXT NOT NULL      -- UTC ISO 8601
+  key            TEXT PRIMARY KEY,               -- sha256 hex, see below
+  p              REAL NOT NULL,
+  served_model   TEXT NOT NULL,                  -- the response's "model" field
+  created_at     TEXT NOT NULL,                  -- UTC ISO 8601
+  prompt_version INTEGER NOT NULL DEFAULT 1      -- PROMPT_VERSION when written (added 2026-10-05)
 );
 ```
 
-- `key = sha256(json.dumps([JEV_MODEL, PROMPT_VERSION, question_sha, window_sha, batch_sha, window_id]))` where `question_sha` is the sha256 of the stripped question, `window_sha` is the sha256 of the window's exact state entry (`{"section", "text"}` as sent), `batch_sha` is the sha256 of the page title and the ordered `window_sha` values of every window in the same request, and `window_id` is the window's id (`w009`). The window id is in the key because identical windows in one batch (a repeated navigation block, for example) share `window_sha` and `batch_sha`, so without it their answers collided and a rerun from the cache returned one window's `p` for both.
+- `key = sha256(json.dumps([JEV_MODEL, PROMPT_VERSION, question_sha, window_sha, batch_sha, window_id]))` where `question_sha` is the sha256 of the stripped question, `window_sha` is the sha256 of the window's exact state entry as sent (`{"text"}` whose first line is the Section line, or `{"section", "text"}` with the line off; either way the heading path is hashed), `batch_sha` is the sha256 of the page title and the ordered `window_sha` values of every window in the same request, and `window_id` is the window's id (`w009`). The window id is in the key because identical windows in one batch (a repeated navigation block, for example) share `window_sha` and `batch_sha`, so without it their answers collided and a rerun from the cache returned one window's `p` for both.
 - Why the batch is in the key: the probe showed a window's `p` moving by up to 0.19 when its neighbours changed. Batching is deterministic for a given page, window size and batch size, so a repeated call with the same settings hits the cache, and a call with different settings asks again rather than reusing answers given under a different context. Window size, batch size and link handling all change `window_sha` or `batch_sha`, so they need no separate key fields.
 - A batch is either fully cached or asked in full. After a successful request, all its rows are written in one transaction. WAL mode; one connection guarded by a lock for the worker threads; `timeout=5`.
-- No page text, no question text and no key is stored: only hashes, probabilities, the served model and a timestamp. Clearing the cache means deleting the file.
+- No page text, no question text and no key is stored: only hashes, probabilities, the served model, a timestamp and the prompt version. Clearing the cache means deleting the file.
+- Pruning (added 2026-10-05). Because the key holds `PROMPT_VERSION`, a row written under an older version can never be read again, and after a change of window size most rows can no longer be reached either. Without a prune the file would keep them forever. `PRAGMA user_version` records the prompt version the file was last pruned for. Opening the cache reads it; when it is current, nothing is written. Otherwise, inside one `BEGIN IMMEDIATE` transaction (so two processes do not migrate the same file at once): a file from before the `prompt_version` column gains it, with its rows counted as version 1; rows with an older version are deleted; `user_version` is set. When rows were deleted, the file is then vacuumed; a failed VACUUM is a warning, not an error. This runs automatically; there is no separate command. A web-sieve process started before the upgrade can still read a migrated file but cannot write to it (its four-value insert no longer matches the table), so it reports `answers cache ... could not be written` until it is restarted; it never got a hit anyway, because its keys hold the older version.
 
 ## 13. Privacy and data boundary
 
@@ -442,6 +470,7 @@ Token model from section 2.2: `tokens ≈ state_chars / 3.9 + 139 x windows + 27
 | Largest cached (1,481,439 chars) | 723 | 46 | about 450,000 | $0.019 | about 6 s (12 rounds) |
 | 5 typical pages in one call | about 250 | about 20 | about 125,000 | $0.005 | about 2.5 s (5 rounds) |
 
+- At 200-token windows (2026-10-05) the calibration pages took 26% more input tokens than at 400 (827,722 for C2 against 656,361 for C1 over the same 27 questions; C2h used 788,721 over the 26 not already asked by the smoke test, about the same per question as C2) and 141 requests against 84; the median time per page was 0.42 to 0.50 s against 0.29 s. The largest cached page (1,482 windows, 93 requests) would take about 24 rounds at concurrency 4, about 12 s, and an estimated 620,000 input tokens (about $0.026).
 - The per-Noul overhead (139 tokens) is about 30% of a page's tokens. Shortening the criteria would reduce it but is not worth an accuracy risk at these prices.
 - Latency is dominated by request rounds, not page size: a request with 16 Nouls took 0.35 to 0.52 s on a warm connection, and one Noul took about 0.23 s.
 - Haiku comparison: the README reports 3 to 5 s for Haiku triage. jevgrep's authors report Haiku at $0.11 against Jev at $0.0024 for the same 585 judgments. The Haiku recipe here runs as Claude Code subagents on the Max plan, so its cost is plan quota rather than a per-token bill; the calibration run records whatever usage the agent results report, for a measured comparison.
@@ -500,19 +529,22 @@ The current recipe is the bar to clear. For each of the 27 pairs, the session di
 
 ```
 uv run --script calibration/calibrate.py --labels calibration/data/labels.jsonl \
-    [--one] [--configs default|all] [--out calibration/data/results/YYYY-MM-DD.json]
+    [--one] [--configs default|all|NAME,NAME,...] [--out calibration/data/results/YYYY-MM-DD.json]
 ```
 
-Configurations (`--configs all`):
+Configurations (`--configs all`; `default` is the one that matches the constants in `web-sieve.py`):
 
-| Name | `window_tokens` | windows per request | links |
-|---|---|---|---|
-| C1 (default) | 400 | 16 | reduced |
-| C2 | 200 | 16 | reduced |
-| C3 | 800 | 16 | reduced |
-| C4 | 400 | 1 | reduced |
-| C5 | 400 | 4 | reduced |
-| C6 | 400 | 16 | kept |
+| Name | `window_tokens` | windows per request | links | heading |
+|---|---|---|---|---|
+| C1 (default until 2026-10-05) | 400 | 16 | reduced | `section` field |
+| C2 | 200 | 16 | reduced | `section` field |
+| C2h (default since 2026-10-05) | 200 | 16 | reduced | Section line |
+| C3 | 800 | 16 | reduced | `section` field |
+| C4 | 400 | 1 | reduced | `section` field |
+| C5 | 400 | 4 | reduced | `section` field |
+| C6 | 400 | 16 | kept | `section` field |
+
+`_relevance` takes `section_line` as a further internal argument for the heading column.
 
 It runs Jev once per pair and configuration and keeps every window's `p` (no threshold is applied at collection time), then for thresholds 0.05 to 0.95 in steps of 0.05, with and without the one-window bridge, it prints and saves:
 
@@ -536,13 +568,34 @@ The full outputs are saved, not just the summary, per the owner's rule that eval
 4. If any condition fails, keep the Haiku recipe, report the numbers to the owner, and stop.
 5. Report, but do not block on: page-level false alarms on `absent` questions; agreement between the two labellers.
 6. On adoption: set `DEFAULT_THRESHOLD` (and `WINDOW_TOKENS`, `WINDOWS_PER_REQUEST` or `STRIP_LINKS` if a non-default configuration won) with a comment giving the date, `jev-1.13.0`, the labelled set and the precision and recall; apply the bridge if section 7.3's condition holds; record the same numbers in the README.
+7. Section line (added 2026-10-05). When a configuration X and its twin Xh (the same with the Section line) are both run, the decision block reports, at `DEFAULT_THRESHOLD`, both recalls and precisions. The line is kept when Xh's recall is at least X's minus 0.01 and Xh's precision is not lower; otherwise `SECTION_LINE` is set to `False`.
 
 ### 15.6 Run discipline
 
-- `--one` first: one pair with configuration C1, printing tokens, cost and time. This is the single-item smoke test.
+- `--one` first: one pair with the default configuration, printing tokens, cost and time. This is the single-item smoke test.
 - Full run: about 27 pairs x 6 configurations, roughly 5 million input tokens (about $0.21) and under 5 minutes at concurrency 4 (C4 alone sends about 1,250 requests). Launch under `gtimeout 900`, with the pid, start time and estimate written to `calibration/data/run.status`.
 - The script stops at the first result whose `status` is not `ok`, writes the results gathered so far to the output file, and exits non-zero. The answers cache means a rerun pays only for what is missing.
 - Calibration data stays out of git: `calibration/data/` is added to `.gitignore`, because the repository is public and the labels name private project directories. Only `calibrate.py` is committed.
+
+### 15.7 Result of 2026-10-05
+
+`--configs C1,C2,C2h` over the 27 labelled pairs of section 15.2, with the existing Sonnet labels and Haiku baseline (not re-run). Prompt version 2 made every pair a cache miss; one pair of C2h had been asked by the `--one` smoke test. 360 requests, 2,272,804 input tokens, $0.095, 32 s under `gtimeout 1200`. Cells are pooled line precision / recall:
+
+| Threshold | C2h (200, Section line) | C2 (200, `section` field) | C1 (400, `section` field) |
+|---|---|---|---|
+| 0.70 | 0.432 / 0.970 | 0.431 / 0.970 | 0.316 / 0.970 |
+| 0.75 | 0.478 / 0.970 | 0.455 / 0.970 | 0.342 / 0.970 |
+| 0.80 | 0.523 / 0.965 | 0.504 / 0.965 | 0.353 / 0.970 |
+| 0.85 | 0.510 / 0.851 | 0.533 / 0.925 | 0.417 / 0.945 |
+| 0.90 | 0.650 / 0.711 | 0.664 / 0.816 | 0.537 / 0.876 |
+| Median wall time per page | 0.42 s | 0.50 s | 0.29 s |
+
+- Page misses: none in any configuration at these thresholds. False alarms on absent questions: one, C2h at 0.70 (page 7).
+- Haiku baseline: precision 0.788, recall 0.960. Labeller agreement F1 0.884.
+- Section line (rule 7): at 0.80 recall 0.965 with and without, precision 0.523 against 0.504, so the line is kept.
+- Threshold: the highest threshold with recall of at least 0.90 for C2h is 0.80, and there all three conditions of step 3 hold (recall 0.965 against 0.940, no page misses, median 0.42 s). `DEFAULT_THRESHOLD` stays 0.80.
+- The decision block over the three configurations together prints `adopt: false`: step 1 gives C2 at 0.85 (recall 0.925), step 2 prefers it to C2h at 0.80 (precision 0.533 and 0.523 are within 0.02 and both need 141 requests), and C2 at 0.85 fails step 3's recall condition. See section 19, item 10.
+- Run-to-run variation: C1 sends the same requests as the second 2026-10-04 run. Between the two days 509 of 1,167 C1 windows and 855 of 2,058 C2 windows changed probability by more than 0.001 (95th percentile 0.04, largest 0.20 and 0.26), and 1 and 4 windows crossed 0.80. C1's precision at 0.80 moved from 0.362 to 0.353. The Section line's gain of 0.019 in precision is of the same size, so the result supports "no loss" more than "a clear gain".
 
 ## 16. Tests
 
@@ -598,7 +651,7 @@ Ranges and thresholds:
 
 Client integration through the fake server:
 
-23. `test_request_shape`: path `/v1/systemone`, bearer header equals the key, `model` is `jev-1.13.0`, state has `question`, `page.title` and `windows.{id}.{section,text}` and no URL, path or line numbers.
+23. `test_request_shape`: path `/v1/systemone`, bearer header equals the key, `model` is `jev-1.13.0`, state has `question`, `page.title` and `windows.{id}.text` starting with the Section line (`windows.{id}.{section,text}` before 2026-10-05), and no URL, path or line numbers.
 24. `test_no_key_sends_nothing_and_exits_4` (MCP result and CLI exit code).
 25. `test_missing_client_returns_no_client_and_fetch_tools_still_work` (`WEB_SIEVE_JEV` set to a missing path).
 26. `test_429_then_answer_is_ok_and_retry_is_reported`: `jev_events` holds a `jev_retry` event with `HTTP 429`.
@@ -622,6 +675,21 @@ Surface:
 38. `test_path_outside_web_cache_or_without_frontmatter_is_refused_and_sends_nothing`.
 39. `test_cli_ranges_prints_json_and_dispatches` (the `__main__` tuple includes `ranges`).
 40. `test_cost_and_tokens_sum_from_usage`.
+
+Added 2026-10-05 (Section line, 200-token windows, `max_windows`, pruning):
+
+41. `test_section_line_names_the_nearest_heading_and_its_parents`: nested ATX headings, a window that starts mid-section inherits the path, a sibling or higher heading closes it.
+42. `test_section_line_follows_setext_headings`.
+43. `test_window_without_a_heading_above_it_gets_section_none`: before the first heading, and a page with none.
+44. `test_heading_lookalikes_inside_a_code_fence_are_not_headings`: a `#` comment and an underlined line inside fences.
+45. `test_section_line_is_capped_at_160_characters_keeping_the_nearest_heading`.
+46. `test_section_line_is_sent_to_jev_but_never_part_of_ranges_or_window_text`, which also checks the `{"section", "text"}` form with the line off.
+47. `test_heading_is_part_of_the_answer_key`: the same text under two headings gets two keys, with the line on or off.
+48. `test_default_max_windows_is_2000`: 1,001 windows judged through the MCP default; 2,001 refused through the CLI default with nothing sent.
+49. `test_answers_cache_prunes_rows_of_older_prompt_versions_and_shrinks`: a version 1 file gains the column, loses its 5,000 rows and shrinks; later opens write nothing; a newer version prunes again.
+50. `test_search_index_is_rebuilt_when_its_version_or_window_size_changes` (in `tests/test_effectiveness.py`).
+
+Tests that had assumed 400-token windows now follow `WINDOW_TOKENS` (the `windows_of` helper defaults to it), and `test_long_lines_reported_inside_selected_ranges` runs at both the default (where the long line is split) and 400 tokens.
 
 Before the calibration run, one real smoke test (not in pytest): `web-sieve ranges "How do I stop Claude Code from running one specific Bash command, such as git push?" <project>/.web_cache/7b0e64d48534.md` (a cached copy of the Claude Code permissions page). Expect `status: ok`, about 4 requests and 25,000 tokens; a second run must show `requests: 0`. Numbers more than twice the section 14 estimates are a reason to stop and investigate.
 
@@ -662,7 +730,7 @@ Keep the single-file design. `install.sh` and the deployed copy at `~/.claude/mc
 Additions, in file order:
 
 - Imports: `math`, `re`, `shutil`, `sqlite3`, `sys`, `threading` (standard library only).
-- Constants block: `JEV_MODEL = "jev-1.13.0"`, `PROMPT_VERSION = 1`, `DEFAULT_THRESHOLD = 0.5`, `WINDOW_TOKENS = 400`, `WINDOWS_PER_REQUEST = 16`, `JEV_CONCURRENCY = 4`, `JEV_POLICY = "default"`, `JEV_TIMEOUT_S = 10.0`, `JEV_HEDGE_AFTER_S = 3.0`, `CHARS_PER_TOKEN = 3.9`, `STATE_TOKEN_BUDGET = 24_000`, `REQUEST_TOKEN_BUDGET = 56_000`, `MAX_WINDOWS = 1_000`, `MAX_QUESTION_CHARS = 2_000`, `PRICE_PER_MTOK_USD = 0.042`, `LONG_LINE_CHARS = 2_000`, `STRIP_LINKS = True`, `NOUL_INSTRUCTIONS`, `NOUL_CRITERIA`, `ANSWERS_DB = "jev_answers.sqlite"`. Each has a one-line comment with its source (measured, docs, or calibrated).
+- Constants block (as built on 2026-10-03; since 2026-10-05 `PROMPT_VERSION = 2`, `WINDOW_TOKENS = 200`, `MAX_WINDOWS = 2_000`, plus `SECTION_LINE = True` and `SECTION_CAP_CHARS = 160`): `JEV_MODEL = "jev-1.13.0"`, `PROMPT_VERSION = 1`, `DEFAULT_THRESHOLD = 0.5`, `WINDOW_TOKENS = 400`, `WINDOWS_PER_REQUEST = 16`, `JEV_CONCURRENCY = 4`, `JEV_POLICY = "default"`, `JEV_TIMEOUT_S = 10.0`, `JEV_HEDGE_AFTER_S = 3.0`, `CHARS_PER_TOKEN = 3.9`, `STATE_TOKEN_BUDGET = 24_000`, `REQUEST_TOKEN_BUDGET = 56_000`, `MAX_WINDOWS = 1_000`, `MAX_QUESTION_CHARS = 2_000`, `PRICE_PER_MTOK_USD = 0.042`, `LONG_LINE_CHARS = 2_000`, `STRIP_LINKS = True`, `NOUL_INSTRUCTIONS`, `NOUL_CRITERIA`, `ANSWERS_DB = "jev_answers.sqlite"`. Each has a one-line comment with its source (measured, docs, or calibrated).
 - `_load_jev()`: section 9.
 - `_read_cached_page(path) -> (lines, body_start, meta)`: section 3.3 checks and section 4.1.
 - `_est_tokens(text) -> int`: section 4.2.
@@ -712,9 +780,11 @@ Success criteria for the build: all tests pass with none skipped; the coverage i
 4. **Persuasive page text** can raise `p` (jevgrep's observation; Jev docs failure mode 6). The effect is limited to extra lines being read.
 5. **Non-English pages.** The docs report lower accuracy outside English. The token estimate keeps such pages inside the budget; accuracy on them is not calibrated.
 6. **Model retirement.** If TypeSafe stops serving `jev-1.13.0`, requests will fail as client errors. Moving to a new version means changing `JEV_MODEL`, which invalidates the cache, and recalibrating.
-7. **Range granularity.** Haiku may return tighter ranges than 400-token windows can. The decision rule compares recall, and reports precision and the fraction of lines selected, so a looser but complete result is visible as such.
+7. **Range granularity.** Haiku may return tighter ranges than 400-token windows can. The decision rule compares recall, and reports precision and the fraction of lines selected, so a looser but complete result is visible as such. Since 2026-10-05 windows are 200 tokens, which raised precision at 0.80 from 0.35 to 0.52 (section 15.7); Haiku's is 0.79.
 8. **`install.sh` conflict** with the Keychain wrapper (section 18.4, step 8). This spec does not fix it; it is recorded for a separate change.
 9. **Public repository.** No third-party page text and no calibration data are committed; test fixtures are synthetic.
+10. **Decision rule step order (open, 2026-10-05).** Step 1 takes each configuration's highest threshold with recall of at least 0.90 before step 3 compares recall with Haiku's, and the rule never falls back to a lower threshold. On 2026-10-05 it picked C2 at 0.85 (recall 0.925), which fails step 3, while C2h at 0.80 passes every condition. A rule that applies step 3's recall condition inside step 1 would have picked C2h at 0.80. The rule was not changed in this revision.
+11. **Run-to-run variation.** Identical requests on 2026-10-04 and 2026-10-05 gave different probabilities for about 44% of windows (95th percentile change 0.04, largest 0.26). Differences between configurations smaller than about 0.02 in precision or recall are within that variation.
 
 ## 20. Out of scope
 

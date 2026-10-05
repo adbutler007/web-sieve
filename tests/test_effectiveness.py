@@ -15,6 +15,7 @@ import json
 import math
 import os
 import socket
+import sqlite3
 import subprocess
 import sys
 import time
@@ -158,7 +159,8 @@ def write_page(folder, name, body, title="Notes", url=None, fetched="2026-10-01T
 
 def sections(texts, tokens=100):
     """One section per text: a heading and a paragraph of about `tokens`
-    tokens that starts with the text. Each section is one 400-token window."""
+    tokens that starts with the text. Each section is one window at the
+    default 200 tokens (above the 40-token minimum, below the target)."""
     return "".join(f"## Section {k}\n\n{t} {words(tokens, k)}\n\n" for k, t in enumerate(texts, 1))
 
 
@@ -672,6 +674,37 @@ def test_search_index_is_invalidated_on_file_change(tmp_path):
     ws._update_manifest(cache)
     out = ws._search("kelly", cache)
     assert out["index"]["removed"] == 1 and [p["file"] for p in out["pages"]] == ["a.md"]
+
+
+def test_search_index_is_rebuilt_when_its_version_or_window_size_changes(tmp_path, monkeypatch):
+    """An index written by an older web-sieve holds windows of another size;
+    reusing it would report line ranges that are not the windows
+    find_relevant_ranges judges. A file stamped with an older index version,
+    or with the current version and another WINDOW_TOKENS, is rebuilt in full."""
+    cache = search_cache_dir(tmp_path)
+    ws._search("kelly", cache)
+    db = os.path.join(cache, ws.SEARCH_INDEX_DB)
+
+    def stamp(value=None):
+        conn = sqlite3.connect(db)
+        try:
+            with conn:
+                if value is not None:
+                    conn.execute("UPDATE meta SET value = ? WHERE key = 'version'", (value,))
+            return conn.execute("SELECT value FROM meta WHERE key = 'version'").fetchone()[0]
+        finally:
+            conn.close()
+
+    assert ws.SEARCH_INDEX_VERSION == 2
+    assert stamp() == f"2:{ws.WINDOW_TOKENS}:{ws.STRIP_LINKS}:{ws.TITLE_WEIGHT}"
+    stamp(f"1:{ws.WINDOW_TOKENS}:{ws.STRIP_LINKS}:{ws.TITLE_WEIGHT}")  # only the index version differs
+    out = ws._search("kelly", cache)
+    assert (out["index"]["rebuilt"], out["index"]["reused"]) == (3, 0)
+    assert ws._search("kelly", cache)["index"]["reused"] == 3
+    monkeypatch.setattr(ws, "WINDOW_TOKENS", 400)  # only the window size differs
+    out = ws._search("kelly", cache)
+    assert (out["index"]["rebuilt"], out["index"]["reused"]) == (3, 0)
+    assert stamp().split(":")[:2] == ["2", "400"]
 
 
 def rerank_cache(tmp_path):

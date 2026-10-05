@@ -22,8 +22,12 @@ public and the page list and labels name private project directories.
 
 Usage:
     uv run --script calibration/calibrate.py --check     # pages and labels only; no Jev requests
-    uv run --script calibration/calibrate.py --one       # smoke test: one pair, C1
+    uv run --script calibration/calibrate.py --one       # smoke test: one pair, the default configuration
     gtimeout 1200 uv run --script calibration/calibrate.py --configs all
+    gtimeout 1200 uv run --script calibration/calibrate.py --configs C1,C2,C2h
+
+--configs default runs the configuration that matches web-sieve.py's
+constants (WINDOW_TOKENS, WINDOWS_PER_REQUEST, STRIP_LINKS, SECTION_LINE).
 
 The run stops at the first result whose status is not ok, writes what it
 has to the output file and exits 1. Answers are cached in each page's
@@ -43,9 +47,10 @@ from importlib.util import module_from_spec, spec_from_loader
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(HERE, "data")
-CONFIGS = {  # name: (window_tokens, windows per request, strip links)
-    "C1": (400, 16, True), "C2": (200, 16, True), "C3": (800, 16, True),
-    "C4": (400, 1, True), "C5": (400, 4, True), "C6": (400, 16, False),
+CONFIGS = {  # name: (window_tokens, windows per request, strip links, Section line); "h" adds the Section line
+    "C1": (400, 16, True, False), "C2": (200, 16, True, False), "C2h": (200, 16, True, True),
+    "C3": (800, 16, True, False), "C4": (400, 1, True, False), "C5": (400, 4, True, False),
+    "C6": (400, 16, False, False),
 }
 KINDS = ("local", "spread", "absent")
 THRESHOLDS = [round(0.05 * k, 2) for k in range(1, 20)]
@@ -54,7 +59,9 @@ RECALL_SLACK = 0.02              # step 3: recall at least the Haiku recall minu
 TIE_PRECISION = 0.02             # step 2: precision ties go to fewer requests
 MAX_MEDIAN_WALL_S = 2.0          # step 3
 BRIDGE_MIN_GAIN, BRIDGE_MAX_EXTRA = 0.02, 0.10  # spec 7.3
-ESTIMATE_S = {"default": 120, "all": 600}
+HEADING_RECALL_SLACK = 0.01      # the Section line stays when, at DEFAULT_THRESHOLD, recall is at least the
+                                 # recall without it minus this and precision is not lower (2026-10-05)
+ESTIMATE_S_PER_CONFIG = 120
 
 
 def load_web_sieve():
@@ -237,7 +244,23 @@ def decide(metrics: dict, costs: dict, haiku: dict) -> dict:
     bridge = ((bridged["recall"] or 0) - chosen["recall"] >= BRIDGE_MIN_GAIN
               and (bridged["fraction_selected"] or 0) <= (chosen["fraction_selected"] or 0) * (1 + BRIDGE_MAX_EXTRA))
     return {"adopt": all(checks.values()), "checks": checks, "chosen": chosen, "bridge": bridge,
-            "bridge_metrics": bridged, "haiku_recall": haiku.get("recall"), "candidates": candidates}
+            "bridge_metrics": bridged, "haiku_recall": haiku.get("recall"),
+            "section_line": section_line_rule(metrics), "candidates": candidates}
+
+
+def section_line_rule(metrics: dict) -> list:
+    """For each configuration X with a twin Xh (the same plus the Section line), both run: at
+    DEFAULT_THRESHOLD, keep the line when Xh's recall is at least X's minus HEADING_RECALL_SLACK and
+    Xh's precision is not lower."""
+    out, t = [], ws.DEFAULT_THRESHOLD
+    for base in sorted(metrics):
+        if base + "h" not in metrics:
+            continue
+        a, b = (next(r for r in metrics[n] if not r["bridge"] and r["threshold"] == t) for n in (base, base + "h"))
+        keep = (b["recall"] or 0) >= (a["recall"] or 0) - HEADING_RECALL_SLACK and (b["precision"] or 0) >= (a["precision"] or 0)
+        out.append({"without": base, "with": base + "h", "threshold": t, "recall": [a["recall"], b["recall"]],
+                    "precision": [a["precision"], b["precision"]], "keep_section_line": keep})
+    return out
 
 
 def jsonable(value):
@@ -252,8 +275,10 @@ def main() -> int:
     parser.add_argument("--labels-second", default=os.path.join(DATA, "labels_second.jsonl"))
     parser.add_argument("--haiku", default=os.path.join(DATA, "haiku_baseline.jsonl"))
     parser.add_argument("--root", default=os.path.expanduser("~/Projects"), help="directory pages.json is relative to")
-    parser.add_argument("--configs", choices=("default", "all"), default="default")
-    parser.add_argument("--one", action="store_true", help="smoke test: one pair with C1, nothing written")
+    parser.add_argument("--configs", default="default",
+                        help="default, all, or names separated by commas (for example C1,C2,C2h)")
+    parser.add_argument("--one", action="store_true",
+                        help="smoke test: one pair with the first configuration named, nothing written")
     parser.add_argument("--check", action="store_true", help="check pages.json and the labels; send nothing")
     parser.add_argument("--out", default=os.path.join(DATA, "results", f"{date.today().isoformat()}.json"))
     args = parser.parse_args()
@@ -273,19 +298,33 @@ def main() -> int:
         print(f"labels ok: {len(pairs)} pairs on {len(pages)} pages" + (f"; second labeller: {len(second)} pairs" if second else ""))
         return 0
 
-    names = ["C1"] if args.configs == "default" or args.one else list(CONFIGS)
+    current = (ws.WINDOW_TOKENS, ws.WINDOWS_PER_REQUEST, ws.STRIP_LINKS, ws.SECTION_LINE)
+    if args.configs == "default":
+        names = [next((n for n, c in CONFIGS.items() if c == current), None)]
+        if names[0] is None:
+            fail(f"no configuration matches web-sieve.py's constants {current}; add one to CONFIGS")
+    elif args.configs == "all":
+        names = list(CONFIGS)
+    else:
+        names = [n.strip() for n in args.configs.split(",") if n.strip()]
+        unknown = [n for n in names if n not in CONFIGS]
+        if unknown or not names:
+            fail(f"unknown configuration {unknown or args.configs!r}; known: {', '.join(CONFIGS)}")
+    names = names[:1] if args.one else names
     todo = pairs[:1] if args.one else pairs
     status_path = os.path.join(DATA, "run.status")
     if not args.one:
         atomic_write(status_path, f"pid={os.getpid()} start={datetime.now(timezone.utc).isoformat()} "
-                                  f"estimate_s={ESTIMATE_S[args.configs]} configs={','.join(names)} pairs={len(todo)}\n")
+                                  f"estimate_s={ESTIMATE_S_PER_CONFIG * len(names)} configs={','.join(names)} "
+                                  f"pairs={len(todo)}\n")
     runs, code = {name: [] for name in names}, 0
     for name in names:
-        window_tokens, batch_size, strip_links = CONFIGS[name]
+        window_tokens, batch_size, strip_links, section_line = CONFIGS[name]
         for pair in todo:
             page = pages[pair["page"]]
             result = ws._relevance(pair["question"], [page["path"]], os.path.dirname(page["path"]), None,
-                                   window_tokens, ws.MAX_WINDOWS, batch_size=batch_size, strip_links=strip_links)[0]
+                                   window_tokens, ws.MAX_WINDOWS, batch_size=batch_size, strip_links=strip_links,
+                                   section_line=section_line)[0]
             runs[name].append({"pair": pair["id"], "result": result})
             print(f"{name} {pair['id']:<10} {result['status']:<8} requests={result['requests']:<3} "
                   f"hits={result['cache_hits']:<3} tokens={result['input_tokens']:<7} "
@@ -299,8 +338,8 @@ def main() -> int:
         if code:
             break
     if args.one:
-        r, pair = runs["C1"][0]["result"], todo[0]
-        print(json.dumps({"pair": pair["id"], "question": pair["question"], "status": r["status"],
+        r, pair = runs[names[0]][0]["result"], todo[0]
+        print(json.dumps({"config": names[0], "pair": pair["id"], "question": pair["question"], "status": r["status"],
                           "ranges": r["ranges"], "gold_lines": len(pair["gold"]), "requests": r["requests"],
                           "input_tokens": r["input_tokens"], "cost_usd": r["cost_usd"],
                           "elapsed_ms": r["elapsed_ms"]}, indent=2))

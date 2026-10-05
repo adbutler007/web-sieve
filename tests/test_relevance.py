@@ -120,8 +120,9 @@ def words(tokens, seed=0):
 
 def sections(probs, tokens=100, level="##"):
     """One section per probability: a heading and a paragraph of about
-    `tokens` tokens carrying the marker. With window_tokens=400 each section
-    is exactly one window (above the 80-token minimum, below the target)."""
+    `tokens` tokens carrying the marker. At the default 200-token windows
+    each section is exactly one window (above the 40-token minimum, below
+    the target)."""
     out = []
     for k, p in enumerate(probs, 1):
         marker = f"[[p={p}]] " if p is not None else ""
@@ -129,7 +130,8 @@ def sections(probs, tokens=100, level="##"):
     return "".join(out)
 
 
-def windows_of(path, window_tokens=400, strip_links=True):
+def windows_of(path, window_tokens=None, strip_links=True):
+    window_tokens = ws.WINDOW_TOKENS if window_tokens is None else window_tokens
     lines, body_start, _ = ws._read_cached_page(path)
     return lines, body_start, ws._windows(lines, body_start, window_tokens, strip_links=strip_links)
 
@@ -291,9 +293,9 @@ def test_oversize_line_is_split_into_segments_covering_every_character(tmp_path,
     segs = [w for w in wins if w.get("line") == n]
     assert len(segs) >= 3
     assert "".join(lines[n - 1][a:b] for a, b in (s["span"] for s in segs)) == lines[n - 1]
-    assert all(s["start"] == s["end"] == n and s["tokens"] <= 800 for s in segs)
+    assert all(s["start"] == s["end"] == n and s["tokens"] <= 2 * ws.WINDOW_TOKENS for s in segs)
     assert all(lines[n - 1][s["span"][1] - 1] == " " for s in segs[:-1])  # cut at whitespace
-    assert_partition(lines, body_start, wins, 400)
+    assert_partition(lines, body_start, wins, ws.WINDOW_TOKENS)
     r = one(QUESTION, path)
     assert r["split_lines"] == {str(n): [s["span"] for s in segs]}
     assert [w[:2] for w in r["windows"] if w[0] == w[1] == n] == [[n, n]] * len(segs)
@@ -314,7 +316,7 @@ def test_blank_only_window_does_not_exist(tmp_path):
     long1, long2 = words(1000), words(1000, 1)
     body = f"\n\n{long1}\n\n\n{long2}\n\n\n"
     lines, body_start, wins = windows_of(make_page(tmp_path, body))
-    assert_partition(lines, body_start, wins, 400)
+    assert_partition(lines, body_start, wins, ws.WINDOW_TOKENS)
     for w in wins:
         assert any(lines[j - 1].strip() for j in range(w["start"], w["end"] + 1))
 
@@ -360,7 +362,8 @@ def test_non_ascii_text_is_sized_conservatively(tmp_path):
     _, _, cjk_wins = windows_of(cjk)
     ascii_page = make_page(tmp_path, sections([None] * 30, tokens=300), name="ascii.md")
     _, _, ascii_wins = windows_of(ascii_page)
-    assert max(len(w["text"]) for w in cjk_wins) <= 800 < max(len(w["text"]) for w in ascii_wins)
+    limit = 2 * ws.WINDOW_TOKENS  # the maximum window in tokens: at most that many CJK characters
+    assert max(len(w["text"]) for w in cjk_wins) <= limit < max(len(w["text"]) for w in ascii_wins)
     lines, body_start, big = windows_of(cjk, window_tokens=4000)
     batches = ws._batches(big, QUESTION, {"title": "小部件手册", "url": "u"})
     assert len(batches) > math.ceil(len(big) / ws.WINDOWS_PER_REQUEST)
@@ -475,7 +478,7 @@ def test_relevant_false_only_when_status_ok(tmp_path, server):
 def test_selected_segment_selects_its_whole_line_once(tmp_path):
     """A split line is read as one line; two selected segments must not
     produce the same line twice, and one selected segment selects it."""
-    line = "[[p=0.9]] " + words(1950) + " [[p=0.9]]"
+    line = "[[p=0.9]] " + words(int(4.9 * ws.WINDOW_TOKENS)) + " [[p=0.9]]"  # three segments of at most 2x
     path = make_page(tmp_path, f"## Long\n\n{words(100)}\n\n{line}\n\n## Other\n\n{words(100, 4)}\n")
     lines, _, wins = windows_of(path)
     n = lines.index(line) + 1
@@ -484,14 +487,18 @@ def test_selected_segment_selects_its_whole_line_once(tmp_path):
     assert r["ranges"] == [[n, n]] and r["lines_selected"] == 1 and r["range_detail"][0]["max_p"] == 0.9
 
 
-def test_long_lines_reported_inside_selected_ranges(tmp_path):
+@pytest.mark.parametrize("window_tokens", [None, 400], ids=["default-split-line", "whole-line-in-a-window"])
+def test_long_lines_reported_inside_selected_ranges(tmp_path, window_tokens):
     """A caller about to Read a range should know when one line in it is
-    large; lines outside the selected ranges are not its concern."""
-    selected, other = words(640), words(770, 3)
+    large; lines outside the selected ranges are not its concern. At the
+    default size a line over LONG_LINE_CHARS is longer than the maximum
+    window, so it is split and a selected segment selects the whole line;
+    at 400 tokens the same line sits whole inside a selected window."""
+    selected, other = "[[p=0.9]] " + words(640), words(770, 3)
     body = f"## Keep\n\n[[p=0.9]] intro\n{selected}\n\n## Skip\n\n{other}\n"
     path = make_page(tmp_path, body)
     lines = ws._read_cached_page(path)[0]
-    r = one(QUESTION, path)
+    r = one(QUESTION, path, **({"window_tokens": window_tokens} if window_tokens else {}))
     assert r["long_lines"] == {str(lines.index(selected) + 1): len(selected)}
     assert len(selected) > ws.LONG_LINE_CHARS and len(other) > ws.LONG_LINE_CHARS
 
@@ -530,7 +537,8 @@ def test_request_shape(tmp_path, server):
     assert set(state) == {"question", "page", "windows"} and state["question"] == QUESTION
     assert state["page"] == {"title": "Test Page"}
     assert list(state["windows"]) == ["w001", "w002", "w003"]
-    assert all(set(entry) == {"section", "text"} for entry in state["windows"].values())
+    for k, entry in enumerate(state["windows"].values(), 1):  # the heading travels as the first line of the text
+        assert set(entry) == {"text"} and entry["text"].startswith(f"Section: Section {k}\n## Section {k}\n")
     q = body["questions"]["w002"]
     assert q["type"] == "noul" and "`windows.w002`" in q["instructions"] and set(q["criteria"]) == {"true", "false"}
     raw = json.dumps(body)
@@ -694,13 +702,13 @@ def test_changed_question_model_prompt_version_or_window_size_misses(tmp_path, s
     assert one(QUESTION, path)["requests"] == 1
     assert one("A different question?", path)["requests"] == 1
     assert one(QUESTION, path, window_tokens=2000)["requests"] == 1
-    monkeypatch.setattr(ws, "PROMPT_VERSION", 2)
-    assert one(QUESTION, path)["requests"] == 1
-    monkeypatch.setattr(ws, "PROMPT_VERSION", 1)
+    assert one(QUESTION, path, section_line=False)["requests"] == 1  # the same windows with the heading as a field
     monkeypatch.setattr(ws, "JEV_MODEL", "jev-1.13.1")
     assert one(QUESTION, path)["requests"] == 1
     monkeypatch.setattr(ws, "JEV_MODEL", "jev-1.13.0")
     assert one(QUESTION, path)["requests"] == 0  # the original answers are still cached
+    monkeypatch.setattr(ws, "PROMPT_VERSION", ws.PROMPT_VERSION + 1)
+    assert one(QUESTION, path)["requests"] == 1  # a newer prompt version misses (and prunes the old rows)
 
 
 def test_partial_failure_keeps_answered_batches(tmp_path, server):
@@ -855,7 +863,7 @@ def test_heading_on_the_first_body_line_starts_the_first_window(tmp_path, headin
     it, and the first window must carry that heading as its section label."""
     path = make_page(tmp_path, f"{heading}\n\n{words(120)}\n\n## Next\n\n{words(120, 2)}\n")
     lines, body_start, wins = windows_of(path)
-    assert_partition(lines, body_start, wins, 400)
+    assert_partition(lines, body_start, wins, ws.WINDOW_TOKENS)
     assert wins[0]["start"] == body_start == 12 and lines[11] == heading.split("\n")[0]
     assert [w["section"] for w in wins] == ["Intro", "Intro > Next"]
 
@@ -906,12 +914,13 @@ def test_line_over_maximum_without_whitespace_is_cut_exactly_at_the_limit(tmp_pa
     line = char * 5000
     path = make_page(tmp_path, f"## Blob\n\n{words(100)}\n\n{line}\n\n{words(100, 3)}\n")
     lines, body_start, wins = windows_of(path)
-    assert_partition(lines, body_start, wins, 400)
+    assert_partition(lines, body_start, wins, ws.WINDOW_TOKENS)
     n = lines.index(line) + 1
     spans = [w["span"] for w in wins if w.get("line") == n]
+    limit = 2 * ws.WINDOW_TOKENS
     assert "".join(line[a:b] for a, b in spans) == line and len(spans) >= 2
-    assert all(ws._est_tokens(line[a:b]) <= 800 for a, b in spans)
-    assert all(ws._est_tokens(line[a:b + 1]) > 800 for a, b in spans[:-1])
+    assert all(ws._est_tokens(line[a:b]) <= limit for a, b in spans)
+    assert all(ws._est_tokens(line[a:b + 1]) > limit for a, b in spans[:-1])
 
 
 def test_crlf_page_numbers_lines_as_read_does(tmp_path, server):
@@ -971,8 +980,8 @@ def test_window_text_with_key_separators_and_json_characters_round_trips(tmp_pat
     r = one(QUESTION, path)
     assert [w[2] for w in r["windows"]] == [0.9, 0.1, 0.95] and len(r["ranges"]) == 2
     sent = server.requests[0]["body"]["state"]["windows"]
-    assert sent["w001"]["section"] == "A > B: {w001}" and tricky in sent["w001"]["text"]
-    assert [sent[w["id"]]["text"] for w in wins] == [w["text"] for w in wins]
+    assert sent["w001"]["text"].startswith("Section: A > B: {w001}\n") and tricky in sent["w001"]["text"]
+    assert [sent[w["id"]]["text"] for w in wins] == [f"Section: {w['heading']}\n{w['text']}" for w in wins]
 
 
 # Range merging
@@ -1413,3 +1422,165 @@ def test_unexpected_worker_exception_is_a_failed_batch_not_a_crash(tmp_path, ser
     captured = capsys.readouterr()
     assert info.value.code == 1 and json.loads(captured.out)[1]["error"]["kind"] == "internal_error"
     assert "Traceback" not in captured.err and "web_sieve_internal_error" in captured.err
+
+
+# ── Section line, max_windows 2,000 and the answers-cache prune ───
+
+
+def section_lines_of(path, **kw):
+    """The first line of the text each window is sent with (Section line on)."""
+    _, _, wins = windows_of(path, **kw)
+    meta = ws._read_cached_page(path)[2]
+    sent = {}
+    for batch in ws._batches(wins, QUESTION, meta, section_line=True):
+        sent.update(batch["request"]["state"]["windows"])
+    return [sent[w["id"]]["text"].split("\n", 1)[0] for w in wins]
+
+
+def test_section_line_names_the_nearest_heading_and_its_parents(tmp_path):
+    """A 200-token window often starts in the middle of a section, and the
+    Section line is then the only place Jev learns which section it is in.
+    It must name the nearest heading above the window with that heading's
+    parents, and drop a heading once a sibling or a higher heading closes it."""
+    body = (f"# Top\n\n{words(100)}\n\n## Mid\n\n{words(100, 1)}\n\n### Low\n\n{words(150, 2)}\n\n"
+            f"{words(150, 3)}\n\n{words(150, 4)}\n\n## Mid two\n\n{words(100, 5)}\n\n# Top two\n\n{words(100, 6)}\n")
+    path = make_page(tmp_path, body)
+    lines, _, wins = windows_of(path)
+    assert section_lines_of(path) == ["Section: Top", "Section: Top > Mid", "Section: Top > Mid > Low",
+                                      "Section: Top > Mid > Low", "Section: Top > Mid two", "Section: Top two"]
+    inherited = wins[3]  # starts mid-section: no heading line of its own
+    assert not any(lines[j - 1].startswith("#") for j in range(inherited["start"], inherited["end"] + 1))
+
+
+def test_section_line_follows_setext_headings(tmp_path):
+    """Setext headings (a line underlined with === or ---) are level 1 and 2,
+    the same as # and ##, so they must build the same path."""
+    body = f"Guide\n=====\n\n{words(100)}\n\nInstall\n-------\n\n{words(150, 1)}\n\n{words(150, 2)}\n\n{words(150, 3)}\n"
+    path = make_page(tmp_path, body)
+    assert section_lines_of(path) == ["Section: Guide", "Section: Guide > Install", "Section: Guide > Install"]
+
+
+def test_window_without_a_heading_above_it_gets_section_none(tmp_path):
+    """Text before the first heading, or on a page with none, has no section;
+    the line says so rather than being left out, so every window is sent in
+    the same shape."""
+    path = make_page(tmp_path, f"{words(150)}\n\n{words(150, 1)}\n\n{words(150, 2)}\n\n## Later\n\n{words(100, 3)}\n")
+    assert section_lines_of(path) == ["Section: (none)", "Section: (none)", "Section: Later"]
+    plain = make_page(tmp_path, f"{words(100)}\n", name="plain.md")
+    assert section_lines_of(plain) == ["Section: (none)"]
+
+
+def test_heading_lookalikes_inside_a_code_fence_are_not_headings(tmp_path):
+    """A shell comment (# ...) or an underlined line inside a code block is
+    code. Taken as a heading, it would replace the real section in the
+    Section line of every later window."""
+    body = (f"## Real\n\n```bash\n# a comment, not a heading\nrun --now\n```\n\n{words(210)}\n\n"
+            f"{words(100, 1)}\n\n~~~\nSetext lookalike\n---\n~~~\n\n{words(210, 2)}\n\n{words(100, 3)}\n")
+    path = make_page(tmp_path, body)
+    assert section_lines_of(path) == ["Section: Real"] * 3
+
+
+def test_section_line_is_capped_at_160_characters_keeping_the_nearest_heading(tmp_path):
+    """A long heading path costs tokens in every window under it. The cap
+    drops top-level headings first, because the nearest heading says most
+    about the window; one heading is cut to 80 characters, as in range_detail."""
+    a, b, c = "A" * 100, "B" * 70, "C" * 70
+    assert ws._heading_path((b, c), True) == f"{b} > {c}"  # 143 characters: kept whole
+    assert ws._heading_path((a, b, c), True) == f"… > {b} > {c}"  # 227 characters before the cap
+    deep = ws._heading_path(tuple(f"H{k} {'x' * 75}" for k in range(6)), True)
+    assert len(deep) <= ws.SECTION_CAP_CHARS == 160 and deep == f"… > H5 {'x' * 75}"
+    assert ws._heading_path(("y" * 300,), True) == "y" * 80 + "…"
+    assert ws._heading_path((), True) == "(none)"
+    body = f"# {a}\n\n{words(50)}\n\n## {b}\n\n{words(50, 1)}\n\n### {c}\n\n{words(210, 2)}\n\n{words(100, 3)}\n"
+    assert section_lines_of(make_page(tmp_path, body))[-1] == f"Section: … > {b} > {c}"
+
+
+def test_section_line_is_sent_to_jev_but_never_part_of_ranges_or_window_text(tmp_path, server):
+    """The Section line exists only in the request. Ranges are file line
+    numbers for Read, so they must be the same with the line on or off, and
+    the window text, which the search index also uses, must not contain it.
+    Off sends the earlier shape: the heading path in its own field."""
+    body = f"## Install\n\n{words(210)}\n\n[[p=0.9]] {words(100, 1)}\n\n## Other\n\n{words(100, 2)}\n"
+    path = make_page(tmp_path, body)
+    on = one(QUESTION, path)
+    sent_on = server.requests[0]["body"]["state"]["windows"]["w002"]
+    off = one(QUESTION, path, section_line=False)
+    sent_off = server.requests[1]["body"]["state"]["windows"]["w002"]
+    _, _, wins = windows_of(path)
+    assert sent_on == {"text": f"Section: Install\n{wins[1]['text']}"} and not wins[1]["text"].startswith("Section:")
+    assert sent_off == {"section": "Install", "text": wins[1]["text"]}
+    assert on["ranges"] == off["ranges"] == [trim(ws._read_cached_page(path)[0], wins[1]["start"], wins[1]["end"])]
+    assert [w[:2] for w in on["windows"]] == [w[:2] for w in off["windows"]]
+    assert on["range_detail"][0]["section"] == "Install"
+
+
+def test_heading_is_part_of_the_answer_key(tmp_path):
+    """The same text under two different headings is two different pieces of
+    evidence, and Jev sees the heading. An answer cached under one heading
+    must never be served for the other, with the heading sent either way."""
+    common = f"[[p=0.9]] {words(100, 7)}"
+    a = make_page(tmp_path, f"## Alpha\n\n{words(210)}\n\n{common}\n", name="a.md")
+    b = make_page(tmp_path, f"## Beta\n\n{words(210)}\n\n{common}\n", name="b.md")
+    meta = {"title": "Test Page", "url": "https://example.com/page"}
+    wa, wb = windows_of(a)[2][1], windows_of(b)[2][1]
+    assert wa["text"] == wb["text"] == common and (wa["id"], wa["heading"], wb["heading"]) == ("w002", "Alpha", "Beta")
+    for section_line in (True, False):  # one window per batch, so only the window's own entry differs
+        key_a, key_b = (ws._batches([w], QUESTION, meta, 1, section_line)[0]["keys"] for w in (wa, wb))
+        assert key_a != key_b
+    relabelled = dict(wb, heading="Alpha", section="Alpha")
+    assert ws._batches([relabelled], QUESTION, meta, 1)[0]["keys"] == ws._batches([wa], QUESTION, meta, 1)[0]["keys"]
+
+
+def test_default_max_windows_is_2000(tmp_path, server, monkeypatch, capsys):
+    """At 200-token windows the largest cached pages have about 1,500
+    windows, and the old limit of 1,000 refused some of them. A page between
+    the two limits is judged with the MCP tool's default; a page over 2,000
+    is refused with the CLI's default, and nothing is sent for it."""
+    assert ws.MAX_WINDOWS == 2000
+    judged = make_page(tmp_path, "".join(f"{words(210, k)}\n\n" for k in range(1001)), name="judged.md")
+    refused = make_page(tmp_path, "".join(f"{words(210, k)}\n\n" for k in range(2001)), name="refused.md")
+    (r,) = call_mcp("find_relevant_ranges", {"question": QUESTION, "sources": [judged]})
+    assert r["status"] == "ok" and len(r["windows"]) == 1001 and r["requests"] == math.ceil(1001 / 16)
+    sent = len(server.requests)
+    code, (out,) = cli(monkeypatch, capsys, QUESTION, refused)
+    assert code == 1 and out["error"]["kind"] == "too_many_windows" and "max_windows is 2000" in out["error"]["message"]
+    assert len(server.requests) == sent
+
+
+def test_answers_cache_prunes_rows_of_older_prompt_versions_and_shrinks(tmp_path, server, monkeypatch):
+    """After a change of window size or prompt version no key can match an
+    old answer again, so without a prune the file would keep them forever.
+    The first open under a newer version deletes them and vacuums the file;
+    the new answers are kept, and a later open writes nothing."""
+    folder = tmp_path / ".web_cache"
+    folder.mkdir()
+    db = folder / ws.ANSWERS_DB
+    conn = sqlite3.connect(db)  # a file written by version 1: no prompt_version column, user_version 0
+    with conn:
+        conn.execute("CREATE TABLE answers (key TEXT PRIMARY KEY, p REAL NOT NULL, served_model TEXT NOT NULL, "
+                     "created_at TEXT NOT NULL)")
+        conn.executemany("INSERT INTO answers VALUES (?, ?, ?, ?)",
+                         [(f"{k:064x}", 0.5, "jev-1.13.0", "2026-10-04T00:00:00+00:00") for k in range(5000)])
+    conn.close()
+    before = db.stat().st_size
+    path = make_page(tmp_path, sections([0.9, 0.1]))
+
+    def rows():
+        conn = sqlite3.connect(db)
+        try:
+            return (conn.execute("SELECT prompt_version, COUNT(*) FROM answers GROUP BY prompt_version").fetchall(),
+                    conn.execute("PRAGMA user_version").fetchone()[0])
+        finally:
+            conn.close()
+
+    r = one(QUESTION, path)
+    assert r["status"] == "ok" and r["requests"] == 1 and r["warnings"] == []
+    assert rows() == ([(ws.PROMPT_VERSION, 2)], ws.PROMPT_VERSION)
+    assert db.stat().st_size < before / 4  # vacuumed, not only emptied
+    cache = ws._AnswerCache(str(folder))
+    assert cache.pruned == 0 and cache.errors == []  # already pruned for this version: nothing to do
+    cache.close()
+    assert one(QUESTION, path)["requests"] == 0  # the new answers survive later opens
+    monkeypatch.setattr(ws, "PROMPT_VERSION", ws.PROMPT_VERSION + 1)
+    assert one(QUESTION, path)["requests"] == 1
+    assert rows() == ([(ws.PROMPT_VERSION, 2)], ws.PROMPT_VERSION)

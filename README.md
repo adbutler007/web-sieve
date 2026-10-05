@@ -131,11 +131,11 @@ A repeat request for a blocked URL within 24 hours of the sidecar's time returns
 
 `search_cache(query, cache_dir, top_k=10, jev=False)` (CLI: `web-sieve search "QUERY" --cache-dir DIR [--top-k N] [--jev]`) finds material the project has already cached, without a network call.
 
-- BM25 (k1 = 1.2, b = 0.75) over the same windows `find_relevant_ranges` uses, tokenised as lower-cased `\w+`, with the page title's tokens counted twice in every window of the page.
+- BM25 (k1 = 1.2, b = 0.75) over the same windows `find_relevant_ranges` uses (200 tokens by default), tokenised as lower-cased `\w+`, with the page title's tokens counted twice in every window of the page. The `Section:` line that `find_relevant_ranges` sends to Jev is not indexed.
 - Output: `status`, `pages` (the top `top_k`), each `{file, url, title, score, windows}`, where `windows` are the page's best three as `[start, end, score]` file line numbers for Read offset/limit; `index` (pages, windows, rebuilt, reused, removed); `warnings`. No page text.
 - Pages come from `manifest.json`; when it is missing or does not match the files on disk, the directory is listed instead, with a warning.
 - Any cache directory is searched, also one with another name or a `.web_cache` link to one, because the lexical search sends nothing anywhere. With `jev=True` only pages whose real directory is named `.web_cache` are sent; the others are reported as `not_a_cached_page`.
-- The index is `search_index.sqlite` in the cache directory. A page is windowed again only when its modification time or size changed and its sha256 changed too, so a repeat query on an unchanged cache only reads the index.
+- The index is `search_index.sqlite` in the cache directory. A page is windowed again only when its modification time or size changed and its sha256 changed too, so a repeat query on an unchanged cache only reads the index. The file is stamped with the index version (2 since 2026-10-05), the window size, the link setting and the title weight; when any of them differs from the running code, the whole index is rebuilt on the next search, so an index built with 400-token windows is replaced by one with 200-token windows.
 - `jev=True` asks Jev about the top 20 windows (with the same state, Noul, answers cache, pinned model and fail-fast rule as `find_relevant_ranges`) and orders pages and windows by its probability; each window becomes `[start, end, score, p]` and each page gains `p`. The output adds `jev_requests`, `cache_hits`, `input_tokens` and `cost_usd`. A Jev failure gives `status` `partial` or `error` with `error.kind`, and the lexical ranking is still returned. The deny list applies (below).
 
 ## audit
@@ -148,7 +148,22 @@ A repeat request for a blocked URL within 24 hours of the sidecar's time returns
 
 ## Jev relevance
 
-`find_relevant_ranges` (CLI: `web-sieve ranges`) replaces the Haiku triage step. It splits the body of each cached page into windows of about 400 tokens, breaking before headings and at blank lines and never inside a code block or table below the 800-token maximum. It asks TypeSafe's Jev one yes/no question per window ("does this window help answer the question?") and returns the line ranges of the windows whose probability is at or above the threshold. Jev cannot return line ranges, so the windows and the ranges are computed in code. The design is in [docs/jev-relevance-spec.md](docs/jev-relevance-spec.md).
+`find_relevant_ranges` (CLI: `web-sieve ranges`) replaces the Haiku triage step. It splits the body of each cached page into windows of about 200 tokens (400 until 2026-10-05), breaking before headings and at blank lines and never inside a code block or table below the 400-token maximum; a window under the 40-token minimum does not end at a heading. It asks TypeSafe's Jev one yes/no question per window ("does this window help answer the question?") and returns the line ranges of the windows whose probability is at or above the threshold. Jev cannot return line ranges, so the windows and the ranges are computed in code. The design is in [docs/jev-relevance-spec.md](docs/jev-relevance-spec.md).
+
+### Windows and the Section line
+
+A 200-token window often starts in the middle of a section, below the heading that says what the section is about. So the text sent to Jev for each window starts with one line naming its heading path:
+
+```
+Section: Configure permissions > Permission rule syntax > Match by input parameter
+<the window's lines>
+```
+
+- The path is the nearest heading above the window's first line (ATX `#` or setext, underlined with `===` or `---`) and its parent headings up to the top level, joined with ` > `. Lines inside code fences are never headings.
+- Each heading is cut to 80 characters, and the whole path is capped at 160 characters by dropping the top-level headings first (shown as `…`), so the nearest heading is always kept.
+- A window above the first heading, or on a page without headings, gets `Section: (none)`.
+- The line exists only in the request. Window line numbers, `ranges`, `range_detail` and the search index do not include it.
+- Before 2026-10-05 the same heading path was sent as a separate `section` field next to the window text. The constant `SECTION_LINE` switches between the two forms; the calibration below compared them.
 
 ### Requirements
 
@@ -168,7 +183,7 @@ CLI exit codes: 0 when every page is `ok`; 4 no key; 2 usage error or client err
 
 ### What is sent to TypeSafe
 
-The question, the page title (or its URL when the title is empty), and the text and section headings of each window, with link targets removed. File paths, line numbers, frontmatter and other pages are not sent. Only files inside a `.web_cache/` directory that start with web-sieve frontmatter are accepted, so no other local file can be sent. Do not put credentials or private data in the question. TypeSafe states that Jev is not trained on customer requests; zero data retention is offered only to enterprise customers.
+The question, the page title (or its URL when the title is empty), and the text of each window with its `Section:` heading line, with link targets removed. File paths, line numbers, frontmatter and other pages are not sent. Only files inside a `.web_cache/` directory that start with web-sieve frontmatter are accepted, so no other local file can be sent. Do not put credentials or private data in the question. TypeSafe states that Jev is not trained on customer requests; zero data retention is offered only to enterprise customers.
 
 ### Deny list
 
@@ -188,31 +203,49 @@ A minimal config file:
 
 - The model is pinned to `jev-1.13.0`, because the threshold is calibrated against one model version. A different served model is kept and reported in `warnings`.
 - 16 windows per request, 4 requests in flight, and the jev client's `default` retry policy (3 attempts within 20 s). web-sieve adds no retries of its own. After the first client error, malformed answer or give-up, no further request is sent in that call.
-- Answers are cached in `jev_answers.sqlite` in the page's `.web_cache/` directory, keyed by model, prompt version, question, window and batch. The file holds hashes, probabilities, the served model and timestamps; it holds no page text, question or key. A repeated call sends no requests, and a rerun after a failure pays only for the batches that failed. Delete the file to clear it.
-- Pages with more windows than `max_windows` (default 1,000) are refused before any request is sent.
+- Answers are cached in `jev_answers.sqlite` in the page's `.web_cache/` directory, keyed by model, prompt version, question, window (including its `Section:` line) and batch. The file holds hashes, probabilities, the served model, the prompt version and timestamps; it holds no page text, question or key. A repeated call sends no requests, and a rerun after a failure pays only for the batches that failed. Delete the file to clear it.
+- Old answers are pruned automatically. A change of prompt version (2 since 2026-10-05, for the Section line) or window size means no old row can be read again. The first time a newer web-sieve opens a cache file, it deletes the rows of older prompt versions and vacuums the file, and records the version in the file (`PRAGMA user_version`) so later opens write nothing. No command is needed. A web-sieve process started before the upgrade can still read the file but can no longer write to it; it reports `answers cache ... could not be written` in `warnings` until it is restarted.
+- Pages with more windows than `max_windows` (default 2,000; 1,000 until 2026-10-05) are refused before any request is sent. At 200-token windows the largest of 1,506 cached pages surveyed on 2026-10-05 had 1,482 windows (93 requests), and 3 had more than 1,000; the median page had 10 windows in one request. The largest request in that survey, with a 2,000-character question, was about 7,800 estimated tokens of state plus its longest question and 10,200 with all its questions, against budgets of 24,000 and 56,000.
 
 ### Threshold and calibration
 
-The default threshold is **0.80**, calibrated on 2026-10-04 with `jev-1.13.0` on 9 pages and 27 questions (a local, a spread and an absent question per page), at 400-token windows, 16 windows per request, link reduction on and no bridging. The calibration ran twice that day: the second run replaced two pages that came from projects the deny list now refuses with a GitHub repository page whose answer sits inside a 16,000-character line and a fund page.
+The default threshold is **0.80**, for the default windows: 200 tokens, the Section line, 16 windows per request, link reduction on and no bridging. It was calibrated with `jev-1.13.0` on 9 pages and 27 questions (a local, a spread and an absent question per page): on 2026-10-04 at 400-token windows, and on 2026-10-05 for the current window size and Section line.
+
+The 2026-10-05 run compared three configurations, with every question asked afresh (2.27 million input tokens, 360 requests, $0.095, 32 s). Each cell is line precision / line recall:
+
+| Threshold | C2h: 200 tokens, Section line (default) | C2: 200 tokens, heading as a field | C1: 400 tokens, heading as a field |
+|---|---|---|---|
+| 0.70 | 0.432 / 0.970 | 0.431 / 0.970 | 0.316 / 0.970 |
+| 0.75 | 0.478 / 0.970 | 0.455 / 0.970 | 0.342 / 0.970 |
+| **0.80** | **0.523 / 0.965** | 0.504 / 0.965 | 0.353 / 0.970 |
+| 0.85 | 0.510 / 0.851 | 0.533 / 0.925 | 0.417 / 0.945 |
+| 0.90 | 0.650 / 0.711 | 0.664 / 0.816 | 0.537 / 0.876 |
+| Median time per page | 0.42 s | 0.50 s | 0.29 s |
+
+Haiku triage, the old recipe (outputs from 2026-10-04, not re-run): precision 0.788, recall 0.960, 9.5 s per page.
+
+- No relevant page was missed at any of these thresholds. The only false alarm (an absent question answered with a range) was C2h at 0.70.
+- **Window size.** At 0.80, 200-token windows raised precision from 0.353 to 0.523 at recall 0.965 against 0.970, and Read takes about two thirds of the lines (3.2% of body lines selected against 4.7%). They need more requests (141 against 84 for the 27 questions); the median time per page was still under 0.5 s.
+- **Section line.** At 0.80 the Section line kept recall (0.965 with and without) and raised precision from 0.504 to 0.523. The rule set for this change was to keep the line when its recall at 0.80 is at least the recall without it minus 0.01 and its precision is not lower, so `SECTION_LINE` is on. The gain is small. The same requests sent on 2026-10-04 and 2026-10-05 got a different probability for about 44% of windows (95th percentile change 0.04, largest 0.26), and C1's precision at 0.80 moved from 0.362 to 0.353 between the two days. A gain of 0.019 is of the same size as that variation, so the measured result is that the line costs nothing, not that it clearly helps.
+- **Threshold.** 0.80 is the highest threshold at which C2h keeps line recall of at least 0.90 (0.85 falls to 0.851, mostly on spread questions), and at 0.80 all three adoption conditions of the spec's decision rule (section 15.5) hold: recall at least the Haiku recall minus 0.02 (0.965 against 0.940), no page misses, and a median time per page under 2 s. So the default stays 0.80. Ranges are still looser than Haiku's (precision 0.52 against 0.79), so expect to read about 1.5 times the lines Haiku would have chosen. Every window's probability is in the output, so a caller can apply another threshold without a new request.
+- The script's own decision block, which applies section 15.5 to the three configurations together, prints `adopt: false`. Its step 1 takes each configuration's highest threshold with recall of at least 0.90, which for C2 is 0.85 (recall 0.925). Step 2 then picks C2 at 0.85 over C2h at 0.80, because their precisions (0.533 and 0.523) are within 0.02 of each other, both need 141 requests, and the tie goes to the higher precision. C2 at 0.85 fails the Haiku recall condition (0.925 against 0.940), and the rule does not fall back to a lower threshold. The rule's step order is an open item in the spec (section 19).
+
+The 2026-10-04 calibration, at 400-token windows with the heading as a field, ran twice: the second run replaced two pages that came from projects the deny list now refuses with a GitHub repository page whose answer sits inside a 16,000-character line and a fund page. At 0.80 no relevant page was missed and no absent question was answered with a range, in either run, and the decision rule passed in both, so `find_relevant_ranges` replaced the Haiku step. In run 2, 0.85 lost gold windows that scored 0.81 and 0.82 and met the Haiku recall condition by 0.0001, so the default moved from 0.85 to 0.80.
 
 | Method | Line recall (run 1 / run 2) | Line precision (run 1 / run 2) | Median time per page |
 |---|---|---|---|
-| Jev at 0.80 (default) | 0.971 / 0.970 | 0.395 / 0.362 | 0.32 / 0.26 s |
+| Jev at 0.80 | 0.971 / 0.970 | 0.395 / 0.362 | 0.32 / 0.26 s |
 | Jev at 0.85 (default after run 1) | 0.967 / 0.940 | 0.426 / 0.420 | the same (the threshold is applied after the answers) |
 | Jev at 0.90 | 0.923 / 0.891 | 0.530 / 0.534 | the same |
 | Jev, 200-token windows at 0.80 | 0.962 / 0.960 | 0.535 / 0.503 | 0.32 s (run 2) |
 | Haiku triage (old recipe) | 0.909 / 0.960 | 0.864 / 0.788 | 9.5 s |
-
-At 0.80 no relevant page was missed and no absent question was answered with a range, in either run. In run 2, 0.85 lost gold windows that scored 0.81 and 0.82, and it met the decision rule's recall condition (recall at least the Haiku recall minus 0.02) by 0.0001. The same window's probability was measured to move by up to 0.19 when its batch changed, so the default moved from 0.85 down to 0.80. The decision rule in section 15.5 of the spec passed in both runs (no page misses, time per page under 2 s), so `find_relevant_ranges` replaces the Haiku step. Its ranges are looser than Haiku's (precision about 0.36 to 0.40 against 0.79 to 0.86), so expect to read about twice the lines Haiku would have chosen. Every window's probability is in the output, so a caller can apply another threshold without a new request.
-
-The rule's own pick in run 2 was 200-token windows at 0.80, which had higher precision than the default 400-token windows in both runs at about the same recall. The window size was not changed with the threshold: a new size re-windows every page, so every cached Jev answer misses and `search_cache` ranks different windows. That is a separate decision.
 
 `calibration/calibrate.py` measures line-level precision and recall against labelled pages and applies the decision rule in section 15.5 of the spec. Its inputs and outputs live in `calibration/data/`, which is gitignored because the page list and the labels name private project directories. To run it:
 
 1. Write `calibration/data/pages.json` (`[{"n", "page", "title", "why"}]`, page paths relative to `~/Projects`). `uv run --script calibration/calibrate.py --check` then prints each page's sha256 and body line range for the labellers.
 2. Write `calibration/data/labels.jsonl`: one line per page from a Sonnet labeller, with a local, a spread and an absent question and their gold line ranges (format in the script's docstring). `--check` validates it.
 3. Write `calibration/data/haiku_baseline.jsonl`: the full output of one Haiku agent per question, given the old step-3 instruction. This is the baseline the tool must match.
-4. `uv run --script calibration/calibrate.py --one` sends one question as a smoke test. Then `gtimeout 1200 uv run --script calibration/calibrate.py --configs all` runs the six configurations (about $0.21) and writes `calibration/data/results/YYYY-MM-DD.json` with every window's probability, the metrics and the decision. The run stops at the first page that is not `ok`.
+4. `uv run --script calibration/calibrate.py --one` sends one question with the default configuration as a smoke test. Then `gtimeout 1200 uv run --script calibration/calibrate.py --configs all` runs the seven configurations, C1 to C6 and C2h (about $0.25); `--configs C1,C2,C2h` runs only the ones named, and `--configs default` the one that matches the constants in `web-sieve.py`. The script writes `calibration/data/results/YYYY-MM-DD.json` with every window's probability, the metrics and the decision, and stops at the first page that is not `ok`.
 
 ### Tests
 
@@ -253,8 +286,8 @@ Other files in the cache directory:
 | `manifest.json` | The same rows as `{file, url, title, fetched, status, bytes, lines}` (blocked rows add `reason`); read by `search_cache`. |
 | `<hash>.blocked.json` | Sidecar for a blocked URL (`url`, `status`, `reason`, `attempts`, `at`). |
 | `_quarantine/` | Pages moved by `audit --apply`, and `quarantine.jsonl`, one line per move. |
-| `jev_answers.sqlite` | Jev answer cache (hashes and probabilities only). |
-| `search_index.sqlite` | `search_cache` index: window line ranges and term counts per page. |
+| `jev_answers.sqlite` | Jev answer cache (hashes and probabilities only). Rows of older prompt versions are deleted, and the file vacuumed, the first time a newer web-sieve opens it. |
+| `search_index.sqlite` | `search_cache` index: window line ranges and term counts per page. Rebuilt in full when its version or the window size changes. |
 
 Files are written through a temporary `.tmp-*.part` file and renamed into place. A process killed while writing leaves its temporary file behind; the next fetch into that cache removes any older than an hour.
 
@@ -266,7 +299,7 @@ Files are written through a temporary `.tmp-*.part` file and renamed into place.
 | Comparison | 3 | 29K chars | 8.5K chars | **70%** |
 | Broad research | 5 | 83K chars | 10.5K chars | **87%** |
 
-Relevance with Jev (`jev-1.13.0`, measured 2026-10-03): a 73,000-character docs page in 53 windows went out as 4 parallel requests, 25,030 input tokens ($0.00105), 0.5 s (design probe). An 11,600-character page in 12 windows took 1 request, 5,334 input tokens ($0.00022), 0.5 s (this implementation). A repeated call is answered from the answers cache with no requests. In the 2026-10-04 calibration Jev took 0.32 s per page and the Haiku triage it replaces 9.5 s.
+Relevance with Jev (`jev-1.13.0`, measured 2026-10-03): a 73,000-character docs page in 53 windows went out as 4 parallel requests, 25,030 input tokens ($0.00105), 0.5 s (design probe). An 11,600-character page in 12 windows took 1 request, 5,334 input tokens ($0.00022), 0.5 s (this implementation). A repeated call is answered from the answers cache with no requests. In the 2026-10-04 calibration (400-token windows) Jev took 0.32 s per page and the Haiku triage it replaces 9.5 s; in the 2026-10-05 calibration at the current 200-token windows the median was 0.42 s per page.
 
 ## What gets stripped
 
