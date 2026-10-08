@@ -136,7 +136,7 @@ web-sieve ranges "QUESTION" SOURCE [SOURCE ...] [--cache-dir DIR] [--threshold T
 - Prints the same JSON list as the MCP tool, indented, on stdout.
 - Jev retry and hedge events also go to stderr as JSON lines (they are in the output too).
 - The `__main__` dispatch tuple gains `"ranges"`: `("read", "batch", "list", "ranges", "--help", "-h")`.
-- Exit codes follow the jev CLI: 0 every source `ok`; 4 no key; 2 usage error or client error (401, 422); 5 malformed answer; 3 gave up (retries or deadline exhausted); 1 any other per-source error (`not_found`, `not_a_cached_page`, `fetch_failed`, `too_many_windows`, `no_client`). When several apply, the first in the order 4, 2, 5, 3, 1 wins.
+- Exit codes follow the jev CLI: 0 every source `ok`; 4 no key; 2 usage error or client error (401, 422); 5 malformed answer; 3 gave up (retries or deadline exhausted); 1 any other per-source error (`not_found`, `not_a_cached_page`, `fetch_failed`, `too_many_windows`, `no_client`, `blocked`, `unreadable`, `over_budget` when nothing else on the page was judged, and `internal_error` for an unexpected exception in a worker, which also stops further batches like a Jev failure). When several apply, the first in the order 4, 2, 5, 3, 1 wins.
 
 ### 3.3 Input rules
 
